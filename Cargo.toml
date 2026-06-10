@@ -27,11 +27,12 @@ strum = "0.27"
 strum_macros = "0.27"
 ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", optional = true }
+numpy = { version = "0.22", optional = true }
 
 [features]
 default = []
 test-utils = []
-python = ["pyo3"]
+python = ["pyo3", "dep:numpy"]
 tui = ["ratatui", "crossterm"]
 csv-export = ["csv"]
 
