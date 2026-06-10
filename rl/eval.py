@@ -11,6 +11,12 @@ import torch
 
 from agent import ActionScorerAgent
 from env_wrapper import VecEnv
+from torch_runtime import (
+    configure_device,
+    load_agent_state,
+    resolve_amp_dtype,
+    resolve_device,
+)
 
 
 def parse_args():
@@ -22,12 +28,20 @@ def parse_args():
     p.add_argument("--episodes", type=int, default=500)
     p.add_argument("--num-envs", type=int, default=32)
     p.add_argument("--seed", type=int, default=12345)
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
+    p.add_argument("--amp", action="store_true", help="use autocast on CUDA")
+    p.add_argument("--amp-dtype", choices=["bf16", "fp16"], default="bf16")
     p.add_argument("--sample", action="store_true", help="sample instead of argmax")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    device = resolve_device(args.device)
+    use_cuda_amp = args.amp and device.type == "cuda"
+    amp_dtype = resolve_amp_dtype(args.amp_dtype)
+    configure_device(device)
+
     env = VecEnv(
         args.deck,
         args.opponent_deck or args.deck,
@@ -35,8 +49,8 @@ def main():
         num_envs=args.num_envs,
         seed=args.seed,
     )
-    agent = ActionScorerAgent(env.obs_dim, env.act_feat_dim)
-    agent.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    agent = ActionScorerAgent(env.obs_dim, env.act_feat_dim).to(device)
+    load_agent_state(agent, args.checkpoint, map_location=device)
     agent.eval()
 
     obs, _oracle, feats, mask = env.reset()
@@ -44,14 +58,17 @@ def main():
     while wins + losses + ties < args.episodes:
         # Evaluation is honest: only the hidden-information observation is
         # used; the oracle view exists solely for the training-time critic.
-        action, _, _ = agent.act(
-            torch.as_tensor(obs, dtype=torch.float32),
-            None,
-            torch.as_tensor(feats, dtype=torch.float32),
-            torch.as_tensor(mask),
-            greedy=not args.sample,
-        )
-        obs, _oracle, feats, mask, _, dones, outcomes = env.step(action.numpy())
+        with torch.inference_mode(), torch.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=use_cuda_amp
+        ):
+            action, _, _ = agent.act(
+                torch.as_tensor(obs, dtype=torch.float32, device=device),
+                None,
+                torch.as_tensor(feats, dtype=torch.float32, device=device),
+                torch.as_tensor(mask, device=device),
+                greedy=not args.sample,
+            )
+        obs, _oracle, feats, mask, _, dones, outcomes = env.step(action.cpu().numpy())
         for done, outcome in zip(dones, outcomes):
             if done:
                 if outcome > 0:

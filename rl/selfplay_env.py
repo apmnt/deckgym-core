@@ -30,6 +30,9 @@ class SelfPlayVecEnv:
         seed: int = 0,
         shaping_coef: float = 0.0,
         latest_prob: float = 0.5,
+        device: str | torch.device = "cpu",
+        amp_enabled: bool = False,
+        amp_dtype: torch.dtype = torch.bfloat16,
     ):
         self._env = PyRlVecEnv(deck_a, deck_b, "self", num_envs, seed, shaping_coef)
         self.num_envs = num_envs
@@ -37,6 +40,9 @@ class SelfPlayVecEnv:
         self.act_feat_dim = self._env.action_feat_dim()
         self.max_actions = self._env.max_actions()
         self.latest_prob = latest_prob
+        self.device = torch.device(device)
+        self.amp_enabled = amp_enabled and self.device.type == "cuda"
+        self.amp_dtype = amp_dtype
         self._latest: torch.nn.Module | None = None
         self._pool: list[torch.nn.Module] = []
         self._rng = np.random.default_rng(seed)
@@ -47,10 +53,10 @@ class SelfPlayVecEnv:
 
     def set_latest(self, agent: torch.nn.Module):
         """Refresh the frozen copy of the learner used as the 'latest' opponent."""
-        self._latest = copy.deepcopy(agent).eval()
+        self._latest = copy.deepcopy(agent).to(self.device).eval()
 
     def add_snapshot(self, agent: torch.nn.Module, max_pool: int):
-        self._pool.append(copy.deepcopy(agent).eval())
+        self._pool.append(copy.deepcopy(agent).to(self.device).eval())
         if len(self._pool) > max_pool:
             self._pool.pop(0)
             # Pool indices shifted down; remap live assignments.
@@ -105,15 +111,19 @@ class SelfPlayVecEnv:
             for key in np.unique(keys):
                 env_ids = waiting[keys == key]
                 net = self._opponent_net(int(key))
-                with torch.no_grad():
+                with torch.inference_mode(), torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.amp_dtype,
+                    enabled=self.amp_enabled,
+                ):
                     actions, _, _ = net.act(
-                        torch.as_tensor(obs[env_ids], dtype=torch.float32),
+                        torch.as_tensor(obs[env_ids], dtype=torch.float32, device=self.device),
                         None,
-                        torch.as_tensor(feats[env_ids], dtype=torch.float32),
-                        torch.as_tensor(mask[env_ids]),
+                        torch.as_tensor(feats[env_ids], dtype=torch.float32, device=self.device),
+                        torch.as_tensor(mask[env_ids], device=self.device),
                     )
                 rewards, dones, outcomes = self._env.step_some(
-                    [int(i) for i in env_ids], [int(a) for a in actions]
+                    [int(i) for i in env_ids], [int(a) for a in actions.cpu()]
                 )
                 self._record(env_ids, rewards, dones, outcomes)
 

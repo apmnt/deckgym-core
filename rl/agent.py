@@ -63,8 +63,8 @@ class ActionScorerAgent(nn.Module):
 
     @torch.no_grad()
     def act(self, obs, oracle_obs, act_feats, mask, greedy: bool = False):
-        logits = self.policy_logits(obs, act_feats, mask)
-        value = self.value(oracle_obs) if oracle_obs is not None else None
+        logits = self.policy_logits(obs, act_feats, mask).float()
+        value = self.value(oracle_obs).float() if oracle_obs is not None else None
         if greedy:
             return logits.argmax(dim=-1), None, value
         dist = torch.distributions.Categorical(logits=logits)

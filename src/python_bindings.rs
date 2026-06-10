@@ -4,6 +4,7 @@ use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::wrap_pyfunction;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::{
@@ -950,11 +951,8 @@ impl PyRlVecEnv {
         let envs = (0..num_envs)
             .map(|i| {
                 let opponent_player = code.clone().map(|code| {
-                    let players = create_players(
-                        deck_a.clone(),
-                        deck_b.clone(),
-                        vec![code.clone(), code],
-                    );
+                    let players =
+                        create_players(deck_a.clone(), deck_b.clone(), vec![code.clone(), code]);
                     players.into_iter().nth(1).unwrap()
                 });
                 RlEnvCore::new(
@@ -1036,8 +1034,13 @@ impl PyRlVecEnv {
         let mut rewards = vec![0.0f32; n];
         let mut dones = vec![false; n];
         let mut outcomes = vec![0i8; n];
-        for (i, (env, action)) in self.envs.iter_mut().zip(actions).enumerate() {
-            let result = env.step(action);
+        let results = self
+            .envs
+            .par_iter_mut()
+            .zip(actions)
+            .map(|(env, action)| env.step(action))
+            .collect::<Vec<_>>();
+        for (i, result) in results.into_iter().enumerate() {
             rewards[i] = result.reward;
             dones[i] = result.done;
             outcomes[i] = result.outcome;
