@@ -40,12 +40,15 @@ of depth N, `m` MCTS.
 
 ## Design notes
 
-- **Observation** (flat f32, ~420 dims for a mirror match): points, turn,
+- **Observation** (flat f32, ~400 dims for a mirror match): points, turn,
   energy zones, per-slot board features (card one-hot over the match's card
   vocabulary, HP, attached energy, status, stage, tool), and per-card-ID
-  counts for both hands, discards, and decks. The engine is fully observable
-  except deck order, and the built-in bots see everything too, so the agent
-  observes the opponent's hand as well.
+  counts of hands, discards, and decks. The *policy* sees only legal
+  information — the opponent's hand and deck composition are zeroed (sizes
+  stay visible). The *critic* reads the full-state oracle view during
+  training (PerfectDou-style); evaluation uses the policy view only. Note
+  the built-in engine bots (v, e2, m) do see everything, so they play with
+  an information advantage over the agent.
 - **Reward**: +1 win / −1 loss / 0 tie, gamma = 1.0 by default (the ByteRL
   recipe). `--shaping <c>` enables potential-based shaping on the prize-point
   differential; it telescopes to zero over an episode so the optimal policy

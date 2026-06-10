@@ -376,7 +376,12 @@ impl RlEnvCore {
     }
 
     /// Write the observation into `out` (must be `obs_dim()` long).
-    pub fn write_observation(&self, out: &mut [f32]) {
+    ///
+    /// With `include_hidden = false` the sections a real player cannot see —
+    /// the opponent's hand contents and deck composition — are left zeroed
+    /// (hand/deck *sizes* stay visible in the globals). The oracle variant
+    /// (`include_hidden = true`) is intended for a training-time critic.
+    pub fn write_observation(&self, out: &mut [f32], include_hidden: bool) {
         debug_assert_eq!(out.len(), self.obs_dim());
         out.fill(0.0);
         let state = &self.state;
@@ -450,9 +455,12 @@ impl RlEnvCore {
             }
         }
 
-        // Card counts per vocab entry: hands, discards, decks (6 × V)
+        // Card counts per vocab entry: hands, discards, decks (6 × V).
+        // The opponent's hand and deck composition are hidden information.
         for player in [AGENT, OPPONENT] {
-            count_cards(&state.hands[player], &self.vocab, &mut out[i..i + v]);
+            if player == AGENT || include_hidden {
+                count_cards(&state.hands[player], &self.vocab, &mut out[i..i + v]);
+            }
             i += v;
         }
         for player in [AGENT, OPPONENT] {
@@ -460,7 +468,9 @@ impl RlEnvCore {
             i += v;
         }
         for player in [AGENT, OPPONENT] {
-            count_cards(&state.decks[player].cards, &self.vocab, &mut out[i..i + v]);
+            if player == AGENT || include_hidden {
+                count_cards(&state.decks[player].cards, &self.vocab, &mut out[i..i + v]);
+            }
             i += v;
         }
         debug_assert_eq!(i, self.obs_dim());
@@ -546,9 +556,13 @@ mod tests {
         let mut steps = 0;
         while episodes < 20 {
             assert!(env.num_actions() >= 2, "env must pause on real decisions");
-            env.write_observation(&mut obs);
+            env.write_observation(&mut obs, false);
             env.write_action_features(&mut feats);
             assert!(obs.iter().all(|x| x.is_finite()));
+            // The hidden (policy) view must reveal no more than the oracle view.
+            let mut oracle = vec![0.0; obs_dim];
+            env.write_observation(&mut oracle, true);
+            assert!(obs.iter().zip(&oracle).all(|(p, o)| *p == 0.0 || p == o));
             let idx = rng.gen_range(0..env.num_actions());
             let result = env.step(idx);
             total_reward += result.reward;
@@ -597,8 +611,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(9);
         for _ in 0..200 {
             assert_eq!(env_a.num_actions(), env_b.num_actions());
-            env_a.write_observation(&mut obs_a);
-            env_b.write_observation(&mut obs_b);
+            env_a.write_observation(&mut obs_a, true);
+            env_b.write_observation(&mut obs_b, true);
             assert_eq!(obs_a, obs_b);
             let idx = rng.gen_range(0..env_a.num_actions());
             let result_a = env_a.step(idx);

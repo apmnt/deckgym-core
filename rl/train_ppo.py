@@ -1,5 +1,8 @@
 """PPO training loop for the deckgym RL environment (CleanRL-style).
 
+The policy acts on hidden-information observations; the critic reads the
+full-state (oracle) observation, which exists only at training time.
+
 Example:
     python rl/train_ppo.py --opponent r --total-steps 2000000
 """
@@ -71,6 +74,7 @@ def main():
     minibatch_size = batch_size // args.num_minibatches
 
     obs_buf = torch.zeros(num_steps, num_envs, env.obs_dim)
+    oracle_buf = torch.zeros(num_steps, num_envs, env.obs_dim)
     feats_buf = torch.zeros(num_steps, num_envs, env.max_actions, env.act_feat_dim)
     mask_buf = torch.zeros(num_steps, num_envs, env.max_actions, dtype=torch.bool)
     actions_buf = torch.zeros(num_steps, num_envs, dtype=torch.long)
@@ -79,7 +83,7 @@ def main():
     dones_buf = torch.zeros(num_steps, num_envs)
     values_buf = torch.zeros(num_steps, num_envs)
 
-    obs, feats, mask = env.reset()
+    obs, oracle_obs, feats, mask = env.reset()
     next_done = torch.zeros(num_envs)
     recent_outcomes: deque[int] = deque(maxlen=200)
     global_step = 0
@@ -88,19 +92,23 @@ def main():
     while global_step < args.total_steps:
         for step in range(num_steps):
             obs_t = torch.as_tensor(obs, dtype=torch.float32)
+            oracle_t = torch.as_tensor(oracle_obs, dtype=torch.float32)
             feats_t = torch.as_tensor(feats, dtype=torch.float32)
             mask_t = torch.as_tensor(mask)
             with torch.no_grad():
                 action, logprob, value = agent.act(
-                    obs_t.to(device), feats_t.to(device), mask_t.to(device)
+                    obs_t.to(device), oracle_t.to(device), feats_t.to(device), mask_t.to(device)
                 )
-            obs_buf[step], feats_buf[step], mask_buf[step] = obs_t, feats_t, mask_t
+            obs_buf[step], oracle_buf[step] = obs_t, oracle_t
+            feats_buf[step], mask_buf[step] = feats_t, mask_t
             actions_buf[step] = action.cpu()
             logprobs_buf[step] = logprob.cpu()
             values_buf[step] = value.cpu()
             dones_buf[step] = next_done
 
-            obs, feats, mask, rewards, dones, outcomes = env.step(action.cpu().numpy())
+            obs, oracle_obs, feats, mask, rewards, dones, outcomes = env.step(
+                action.cpu().numpy()
+            )
             rewards_buf[step] = torch.as_tensor(rewards)
             next_done = torch.as_tensor(dones, dtype=torch.float32)
             for done, outcome in zip(dones, outcomes):
@@ -111,11 +119,9 @@ def main():
         # GAE. Done envs auto-reset, so the value of the post-done observation
         # belongs to the next episode and is masked out by next_done.
         with torch.no_grad():
-            next_value = agent.act(
-                torch.as_tensor(obs, dtype=torch.float32).to(device),
-                torch.as_tensor(feats, dtype=torch.float32).to(device),
-                torch.as_tensor(mask).to(device),
-            )[2].cpu()
+            next_value = agent.value(
+                torch.as_tensor(oracle_obs, dtype=torch.float32).to(device)
+            ).cpu()
         advantages = torch.zeros_like(rewards_buf)
         last_gae = torch.zeros(num_envs)
         for t in reversed(range(num_steps)):
@@ -131,6 +137,7 @@ def main():
         returns = advantages + values_buf
 
         b_obs = obs_buf.reshape(batch_size, -1)
+        b_oracle = oracle_buf.reshape(batch_size, -1)
         b_feats = feats_buf.reshape(batch_size, env.max_actions, -1)
         b_mask = mask_buf.reshape(batch_size, -1)
         b_actions = actions_buf.reshape(-1)
@@ -145,7 +152,10 @@ def main():
             for mb_start in range(0, batch_size, minibatch_size):
                 mb = indices[mb_start : mb_start + minibatch_size]
                 logits, value = agent(
-                    b_obs[mb].to(device), b_feats[mb].to(device), b_mask[mb].to(device)
+                    b_obs[mb].to(device),
+                    b_oracle[mb].to(device),
+                    b_feats[mb].to(device),
+                    b_mask[mb].to(device),
                 )
                 dist = torch.distributions.Categorical(logits=logits)
                 new_logprob = dist.log_prob(b_actions[mb].to(device))
@@ -173,14 +183,14 @@ def main():
 
         if recent_outcomes:
             wins = sum(1 for o in recent_outcomes if o > 0)
-            losses = sum(1 for o in recent_outcomes if o < 0)
+            n_losses = sum(1 for o in recent_outcomes if o < 0)
             win_rate = wins / len(recent_outcomes)
         else:
-            win_rate, losses = float("nan"), 0
+            win_rate, n_losses = float("nan"), 0
         sps = int(global_step / (time.time() - start))
         print(
             f"step={global_step} win_rate={win_rate:.3f} "
-            f"(n={len(recent_outcomes)}, losses={losses}) "
+            f"(n={len(recent_outcomes)}, losses={n_losses}) "
             f"v_loss={v_loss.item():.3f} pg_loss={pg_loss.item():.3f} "
             f"clipfrac={np.mean(clipfracs):.3f} sps={sps}",
             flush=True,

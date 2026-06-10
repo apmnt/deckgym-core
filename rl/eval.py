@@ -39,16 +39,19 @@ def main():
     agent.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
     agent.eval()
 
-    obs, feats, mask = env.reset()
+    obs, _oracle, feats, mask = env.reset()
     wins = losses = ties = 0
     while wins + losses + ties < args.episodes:
+        # Evaluation is honest: only the hidden-information observation is
+        # used; the oracle view exists solely for the training-time critic.
         action, _, _ = agent.act(
             torch.as_tensor(obs, dtype=torch.float32),
+            None,
             torch.as_tensor(feats, dtype=torch.float32),
             torch.as_tensor(mask),
             greedy=not args.sample,
         )
-        obs, feats, mask, _, dones, outcomes = env.step(action.numpy())
+        obs, _oracle, feats, mask, _, dones, outcomes = env.step(action.numpy())
         for done, outcome in zip(dones, outcomes):
             if done:
                 if outcome > 0:

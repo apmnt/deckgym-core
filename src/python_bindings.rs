@@ -876,6 +876,7 @@ pub struct PyRlVecEnv {
 type StepArrays<'py> = (
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<u32>>,
 );
 
@@ -885,10 +886,12 @@ impl PyRlVecEnv {
         let feat_dim = self.envs[0].action_feat_dim();
         let n = self.envs.len();
         let mut obs = vec![0.0f32; n * obs_dim];
+        let mut oracle_obs = vec![0.0f32; n * obs_dim];
         let mut feats = vec![0.0f32; n * MAX_ACTIONS * feat_dim];
         let mut n_actions = vec![0u32; n];
         for (i, env) in self.envs.iter().enumerate() {
-            env.write_observation(&mut obs[i * obs_dim..(i + 1) * obs_dim]);
+            env.write_observation(&mut obs[i * obs_dim..(i + 1) * obs_dim], false);
+            env.write_observation(&mut oracle_obs[i * obs_dim..(i + 1) * obs_dim], true);
             env.write_action_features(
                 &mut feats[i * MAX_ACTIONS * feat_dim..(i + 1) * MAX_ACTIONS * feat_dim],
             );
@@ -896,6 +899,7 @@ impl PyRlVecEnv {
         }
         (
             obs.into_pyarray_bound(py),
+            oracle_obs.into_pyarray_bound(py),
             feats.into_pyarray_bound(py),
             n_actions.into_pyarray_bound(py),
         )
@@ -966,7 +970,10 @@ impl PyRlVecEnv {
         MAX_ACTIONS
     }
 
-    /// Reset all environments. Returns (obs, action_feats, n_actions), flat.
+    /// Reset all environments.
+    /// Returns (obs, oracle_obs, action_feats, n_actions), flat.
+    /// `obs` hides the opponent's hand/deck composition (what a real player
+    /// sees); `oracle_obs` is the full state for a training-time critic.
     fn reset<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
         for env in &mut self.envs {
             env.reset();
@@ -976,9 +983,9 @@ impl PyRlVecEnv {
 
     /// Step every environment with the chosen legal-action indices.
     ///
-    /// Returns (obs, action_feats, n_actions, rewards, dones, outcomes).
-    /// `outcomes[i]` is +1/-1/0 from the agent's perspective and only
-    /// meaningful where `dones[i]` is true. Done envs auto-reset; their
+    /// Returns (obs, oracle_obs, action_feats, n_actions, rewards, dones,
+    /// outcomes). `outcomes[i]` is +1/-1/0 from the agent's perspective and
+    /// only meaningful where `dones[i]` is true. Done envs auto-reset; their
     /// returned observation is the first decision of the next episode.
     #[allow(clippy::type_complexity)]
     fn step<'py>(
@@ -986,6 +993,7 @@ impl PyRlVecEnv {
         py: Python<'py>,
         actions: Vec<usize>,
     ) -> PyResult<(
+        Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<f32>>,
         Bound<'py, PyArray1<u32>>,
@@ -1019,9 +1027,10 @@ impl PyRlVecEnv {
             dones[i] = result.done;
             outcomes[i] = result.outcome;
         }
-        let (obs, feats, n_actions) = self.arrays(py);
+        let (obs, oracle_obs, feats, n_actions) = self.arrays(py);
         Ok((
             obs,
+            oracle_obs,
             feats,
             n_actions,
             rewards.into_pyarray_bound(py),

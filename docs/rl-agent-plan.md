@@ -19,14 +19,20 @@ stronger built-in opponents, then self-play.
 ## Why this game is friendlier than most CCGs
 
 The engine is **fully observable except deck order** (both hands visible to
-all `Player`s), making it a perfect-information *stochastic* game like
-backgammon rather than a hidden-information game. Consequences:
+all `Player`s). The agent, however, is trained to play the *real* game: its
+policy observes only legal information (opponent hand/deck composition
+hidden, sizes visible), while the critic reads the full-state oracle view
+during training — PerfectDou's perfect-training-imperfect-execution.
+Consequences:
 
-- The built-in ValueFunction/Expectiminimax bots are fair opponents.
-- AlphaZero-style MCTS with chance nodes is theoretically sound here (it is
-  not in hidden-hand games, where determinization causes strategy fusion).
-  Still deferred: every strong CCG agent shipped model-free policy-gradient
-  first, and search multiplies per-move cost.
+- The built-in ValueFunction/Expectiminimax bots see everything and thus
+  play with an information edge over the agent; beating them is a stronger
+  result than parity suggests.
+- AlphaZero-style MCTS with chance nodes would be sound for the *open-hand*
+  variant of this engine; for the hidden-hand policy it would need
+  determinization (IS-MCTS). Deferred either way: every strong CCG agent
+  shipped model-free policy-gradient first, and search multiplies per-move
+  cost.
 
 ## Architecture
 
