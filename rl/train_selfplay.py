@@ -24,11 +24,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from agent import ActionScorerAgent
+from agent import make_agent
 from selfplay_env import SelfPlayVecEnv
 from torch_runtime import (
+    agent_from_checkpoint,
     configure_device,
-    load_agent_state,
     make_grad_scaler,
     maybe_compile,
     resolve_amp_dtype,
@@ -54,6 +54,10 @@ def parse_args():
     p.add_argument("--update-epochs", type=int, default=4)
     p.add_argument("--num-minibatches", type=int, default=8)
     p.add_argument("--shaping", type=float, default=0.0, help="potential-based shaping coef")
+    p.add_argument("--arch", choices=["res", "mlp"], default="res", help="network architecture")
+    p.add_argument("--hidden", type=int, default=None, help="trunk width (default: arch default)")
+    p.add_argument("--blocks", type=int, default=4, help="residual blocks (res arch)")
+    p.add_argument("--heads", type=int, default=4, help="action-attention heads (res arch)")
     p.add_argument("--latest-prob", type=float, default=0.5)
     p.add_argument("--pool-size", type=int, default=20)
     p.add_argument("--snapshot-every", type=int, default=15, help="updates between pool snapshots")
@@ -91,10 +95,16 @@ def main():
         amp_enabled=use_cuda_amp,
         amp_dtype=amp_dtype,
     )
-    raw_agent = ActionScorerAgent(env.obs_dim, env.act_feat_dim).to(device)
     if args.resume:
-        load_agent_state(raw_agent, args.resume, map_location=device)
-        print(f"resumed weights from {args.resume}")
+        # The checkpoint dictates the architecture; --arch/--hidden are ignored.
+        raw_agent = agent_from_checkpoint(
+            args.resume, env.obs_dim, env.act_feat_dim, map_location=device
+        ).to(device)
+        print(f"resumed weights from {args.resume} ({type(raw_agent).__name__})")
+    else:
+        raw_agent = make_agent(
+            env.obs_dim, env.act_feat_dim, args.arch, args.hidden, args.blocks, args.heads
+        ).to(device)
     agent = maybe_compile(raw_agent, args.compile)
     optimizer = torch.optim.Adam(raw_agent.parameters(), lr=args.lr, eps=1e-5)
     scaler = make_grad_scaler(device, use_cuda_amp and amp_dtype == torch.float16)

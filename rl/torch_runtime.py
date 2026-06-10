@@ -60,6 +60,14 @@ def load_agent_state(agent: nn.Module, checkpoint, map_location) -> None:
     agent.load_state_dict(_normalize_state_dict(state_dict))
 
 
+def agent_from_checkpoint(checkpoint, obs_dim: int, act_feat_dim: int, map_location) -> nn.Module:
+    """Build whichever architecture/size the checkpoint was trained with."""
+    from agent import agent_from_state_dict
+
+    state_dict = _normalize_state_dict(torch.load(checkpoint, map_location=map_location))
+    return agent_from_state_dict(state_dict, obs_dim, act_feat_dim)
+
+
 def save_agent_state(agent: nn.Module, checkpoint) -> None:
     state_dict = _normalize_state_dict(agent.state_dict())
     torch.save({key: value.detach().cpu() for key, value in state_dict.items()}, checkpoint)

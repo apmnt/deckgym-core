@@ -9,11 +9,10 @@ import argparse
 import numpy as np
 import torch
 
-from agent import ActionScorerAgent
 from env_wrapper import VecEnv
 from torch_runtime import (
+    agent_from_checkpoint,
     configure_device,
-    load_agent_state,
     resolve_amp_dtype,
     resolve_device,
 )
@@ -49,8 +48,9 @@ def main():
         num_envs=args.num_envs,
         seed=args.seed,
     )
-    agent = ActionScorerAgent(env.obs_dim, env.act_feat_dim).to(device)
-    load_agent_state(agent, args.checkpoint, map_location=device)
+    agent = agent_from_checkpoint(
+        args.checkpoint, env.obs_dim, env.act_feat_dim, map_location=device
+    ).to(device)
     agent.eval()
 
     obs, _oracle, feats, mask = env.reset()

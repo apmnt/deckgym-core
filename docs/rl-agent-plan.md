@@ -90,6 +90,19 @@ self-play) and `rl/checkpoints/selfplay_3m.pt` (final, best).
 | `v` value-function | ~96% | ~97% | opponent sees the agent's hand; agent does not |
 | `e2` expectiminimax-2 | ~44% | **~49%** | parity with an open-hand searcher |
 
+## Network scaling (phase 6)
+
+`ResAttnAgent` (default `--arch res`, ~4.8M params vs ~360k for the original
+MLP): pre-norm residual GELU trunk (512×4 blocks) for both the policy and
+oracle-critic encoders, plus multi-head self-attention over the legal-action
+tokens — each action is scored in the context of the other available actions
+(combo/tempo comparisons the independent scorer couldn't express). Checkpoint
+architecture is auto-detected on load, so the committed small-net checkpoints
+remain usable. The next architectural lever after this is recurrent memory
+(GRU over decision steps) for opponent-hand inference, which requires
+per-env hidden-state plumbing through the rollout and the self-play opponent
+pool.
+
 Lessons so far:
 
 - The stage-3 fine-tune *directly against e2* did not improve on the stage-2
