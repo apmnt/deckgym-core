@@ -75,3 +75,28 @@ benefits from more cores; the code stays CPU-friendly (small MLPs).
 
 - Random vs random mirror: ~9% win / ~11% loss / ~80% tie (turn-30 limit),
   ~42 agent decisions per episode.
+
+## Results — hidden-information agent, venusaur-exeggutor mirror
+
+Curriculum: 400k steps vs `r` → 250k vs `v` (cut at plateau) → 600k vs `e2`.
+Greedy-policy evals; the e2 number pools 364 episodes across seeds. The
+checkpoint is `rl/checkpoints/hidden_info_stage2.pt`.
+
+| Opponent | Win rate | Notes |
+|---|---|---|
+| `r` random | 100% | |
+| `v` value-function | ~96% | opponent sees the agent's hand; agent does not |
+| `e2` expectiminimax-2 | ~44% | near-parity against an open-hand searcher |
+
+Lessons so far:
+
+- The stage-3 fine-tune *directly against e2* did not improve on the stage-2
+  checkpoint (paired-seed evals put it ~4pp worse) — sparse ±1 rewards
+  against a much stronger opponent stall; next levers are point-differential
+  shaping during that stage, mixed-opponent training, or going straight to
+  self-play with an opponent pool (phase 5).
+- Hiding the opponent's hand barely slowed early learning (stage 1 reached
+  99% vs random on the same schedule as the open-hand run), and the oracle
+  critic carried stage 2 to ~96% vs `v`.
+- Training SPS on 4 CPU cores: ~900 vs `r`/`v`, ~360 vs `e2` (opponent runs
+  a depth-2 search per move).
