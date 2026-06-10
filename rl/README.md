@@ -113,15 +113,26 @@ recursive legal actions, and evaluating leaf states.
 Training defaults to `--arch res` (`ResAttnAgent`, ~4.8M params): a pre-norm
 residual GELU trunk (`--hidden 512`, `--blocks 4`) plus self-attention across
 the legal-action tokens (`--heads 4`), so actions are scored relative to each
-other rather than independently. `--arch mlp` is the original small network
-(~360k params). Checkpoints embed their architecture implicitly — `eval.py`
-and `--resume` auto-detect it from the state dict, so old checkpoints keep
-working (`--arch`/`--hidden` are ignored when resuming).
+other rather than independently. `--arch tx` (`TokenTransformerAgent`) cuts
+the flat observation back into semantic tokens — globals, 8 board slots, 6
+zone count vectors — and runs a TransformerEncoder over them (`--hidden 256`,
+`--blocks 3` layers). `--arch mlp` is the original small network (~360k
+params).
+
+`--memory` (res/tx) inserts a GRU cell over decision steps on the policy
+path, giving the agent within-game memory for hidden-information inference;
+the oracle critic stays feedforward (full state ≈ Markov). With memory, PPO
+minibatches become env-major sequences and the GRU is replayed over the
+rollout with stored initial hidden states (BPTT); self-play opponents carry
+their own per-env hidden state.
+
+Checkpoints embed their architecture implicitly — `eval.py` and `--resume`
+auto-detect arch, sizes, and memory from the state dict, so old checkpoints
+keep working (`--arch`/`--hidden`/`--memory` are ignored when resuming).
 
 When scaling further (per the upgrades guide): raise `--ent-coef` to
-0.02–0.03 early in training, grow the per-update batch via `--num-envs`
-before touching `--lr`, and consider a GRU over decision steps next — memory
-is the biggest remaining architectural gap for hidden-information play.
+0.02–0.03 early in training and grow the per-update batch via `--num-envs`
+before touching `--lr`.
 
 ## Design notes
 

@@ -98,10 +98,25 @@ oracle-critic encoders, plus multi-head self-attention over the legal-action
 tokens — each action is scored in the context of the other available actions
 (combo/tempo comparisons the independent scorer couldn't express). Checkpoint
 architecture is auto-detected on load, so the committed small-net checkpoints
-remain usable. The next architectural lever after this is recurrent memory
-(GRU over decision steps) for opponent-hand inference, which requires
-per-env hidden-state plumbing through the rollout and the self-play opponent
-pool.
+remain usable.
+
+Implemented on top of it:
+
+- `--memory`: GRU cell over decision steps (policy path only — the oracle
+  critic sees the full, near-Markov state and stays feedforward). Training
+  uses env-major sequence minibatches with BPTT over the rollout; frozen
+  self-play opponents keep per-env hidden states, zeroed at episode ends.
+  This is the lever that lets the policy *infer* the opponent's hidden hand
+  from observed plays rather than reacting to snapshots.
+- `--arch tx` (`TokenTransformerAgent`): structured encoder — the flat
+  observation is sliced back into 15 semantic tokens (1 globals, 8 board
+  slots with shared projection + position embeddings, 6 zone count vectors
+  with zone embeddings) and a 3-layer TransformerEncoder reasons over them.
+  Within a fixed mirror match its payoff over `res` is uncertain; its real
+  value is multi-deck generalization, where shared card/zone projections
+  transfer across matchups. Per-card hand/board tokens (instead of zone
+  count vectors) would need the Rust env to emit token observations — the
+  natural next step if multi-deck training begins.
 
 Lessons so far:
 

@@ -54,10 +54,17 @@ def parse_args():
     p.add_argument("--update-epochs", type=int, default=4)
     p.add_argument("--num-minibatches", type=int, default=8)
     p.add_argument("--shaping", type=float, default=0.0, help="potential-based shaping coef")
-    p.add_argument("--arch", choices=["res", "mlp"], default="res", help="network architecture")
+    p.add_argument(
+        "--arch", choices=["res", "tx", "mlp"], default="res", help="network architecture"
+    )
     p.add_argument("--hidden", type=int, default=None, help="trunk width (default: arch default)")
-    p.add_argument("--blocks", type=int, default=4, help="residual blocks (res arch)")
-    p.add_argument("--heads", type=int, default=4, help="action-attention heads (res arch)")
+    p.add_argument(
+        "--blocks", type=int, default=None, help="residual blocks / transformer layers"
+    )
+    p.add_argument("--heads", type=int, default=4, help="attention heads")
+    p.add_argument(
+        "--memory", action="store_true", help="GRU over decision steps (res/tx arch)"
+    )
     p.add_argument("--latest-prob", type=float, default=0.5)
     p.add_argument("--pool-size", type=int, default=20)
     p.add_argument("--snapshot-every", type=int, default=15, help="updates between pool snapshots")
@@ -100,10 +107,17 @@ def main():
         raw_agent = agent_from_checkpoint(
             args.resume, env.obs_dim, env.act_feat_dim, map_location=device
         ).to(device)
+        args.memory = getattr(raw_agent, "gru", None) is not None
         print(f"resumed weights from {args.resume} ({type(raw_agent).__name__})")
     else:
         raw_agent = make_agent(
-            env.obs_dim, env.act_feat_dim, args.arch, args.hidden, args.blocks, args.heads
+            env.obs_dim,
+            env.act_feat_dim,
+            args.arch,
+            args.hidden,
+            args.blocks,
+            args.heads,
+            memory=args.memory,
         ).to(device)
     agent = maybe_compile(raw_agent, args.compile)
     optimizer = torch.optim.Adam(raw_agent.parameters(), lr=args.lr, eps=1e-5)
@@ -130,12 +144,15 @@ def main():
 
     obs, oracle_obs, feats, mask = env.reset()
     next_done = torch.zeros(num_envs, device=device)
+    h = raw_agent.initial_state(num_envs, device)
     recent_outcomes: deque[int] = deque(maxlen=200)
     global_step = 0
     update = 0
     start = time.time()
 
     while global_step < args.total_steps:
+        # Hidden state at rollout start, replayed during the BPTT update.
+        h0 = h.clone() if h is not None else None
         for step in range(num_steps):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
             oracle_t = torch.as_tensor(oracle_obs, dtype=torch.float32, device=device)
@@ -144,8 +161,8 @@ def main():
             with torch.inference_mode(), torch.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=use_cuda_amp
             ):
-                action, logprob, value = raw_agent.act(
-                    obs_t, oracle_t, feats_t, mask_t
+                action, logprob, value, h = raw_agent.act(
+                    obs_t, oracle_t, feats_t, mask_t, h
                 )
             obs_buf[step], oracle_buf[step] = obs_t, oracle_t
             feats_buf[step], mask_buf[step] = feats_t, mask_t
@@ -159,6 +176,10 @@ def main():
             )
             rewards_buf[step] = torch.as_tensor(rewards, dtype=torch.float32, device=device)
             next_done = torch.as_tensor(dones, dtype=torch.float32, device=device)
+            if h is not None:
+                # Memory belongs to an episode: zero it where one just ended.
+                # clone() also escapes inference mode for the h0 snapshot.
+                h = h.clone() * (1.0 - next_done).unsqueeze(-1)
             for done, outcome in zip(dones, outcomes):
                 if done:
                     recent_outcomes.append(int(outcome))
@@ -194,31 +215,59 @@ def main():
         b_returns = returns.reshape(-1)
 
         clipfracs = []
+        envs_per_mb = max(1, num_envs // args.num_minibatches)
         for _ in range(args.update_epochs):
-            indices = torch.randperm(batch_size, device=device)
-            for mb_start in range(0, batch_size, minibatch_size):
-                mb = indices[mb_start : mb_start + minibatch_size]
+            if args.memory:
+                # Sequence (env-major) minibatches: the GRU must be replayed
+                # over whole rollouts, so we shuffle envs, not flat steps.
+                perm = torch.randperm(num_envs, device=device)
+                mb_list = [perm[s : s + envs_per_mb] for s in range(0, num_envs, envs_per_mb)]
+            else:
+                indices = torch.randperm(batch_size, device=device)
+                mb_list = [
+                    indices[s : s + minibatch_size] for s in range(0, batch_size, minibatch_size)
+                ]
+            for mb in mb_list:
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_cuda_amp):
-                    logits, value = agent(
-                        b_obs[mb],
-                        b_oracle[mb],
-                        b_feats[mb],
-                        b_mask[mb],
-                    )
+                    if args.memory:
+                        logits = raw_agent.policy_logits_seq(
+                            obs_buf[:, mb],
+                            feats_buf[:, mb],
+                            mask_buf[:, mb],
+                            h0[mb] if h0 is not None else None,
+                            dones_buf[:, mb],
+                        )
+                        value = raw_agent.value(
+                            oracle_buf[:, mb].reshape(logits.shape[0], -1)
+                        )
+                        mb_actions = actions_buf[:, mb].reshape(-1)
+                        mb_logprobs = logprobs_buf[:, mb].reshape(-1)
+                        mb_adv = advantages[:, mb].reshape(-1)
+                        mb_returns = returns[:, mb].reshape(-1)
+                    else:
+                        logits, value = agent(
+                            b_obs[mb],
+                            b_oracle[mb],
+                            b_feats[mb],
+                            b_mask[mb],
+                        )
+                        mb_actions = b_actions[mb]
+                        mb_logprobs = b_logprobs[mb]
+                        mb_adv = b_advantages[mb]
+                        mb_returns = b_returns[mb]
                     logits = logits.float()
                     value = value.float()
                     dist = torch.distributions.Categorical(logits=logits)
-                    new_logprob = dist.log_prob(b_actions[mb])
+                    new_logprob = dist.log_prob(mb_actions)
                     entropy = dist.entropy()
-                    logratio = new_logprob - b_logprobs[mb]
+                    logratio = new_logprob - mb_logprobs
                     ratio = logratio.exp()
-                    mb_adv = b_advantages[mb]
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                     pg_loss = torch.max(
                         -mb_adv * ratio,
                         -mb_adv * ratio.clamp(1 - args.clip_coef, 1 + args.clip_coef),
                     ).mean()
-                    v_loss = 0.5 * (value - b_returns[mb]).pow(2).mean()
+                    v_loss = 0.5 * (value - mb_returns).pow(2).mean()
                     loss = pg_loss - args.ent_coef * entropy.mean() + args.vf_coef * v_loss
                 with torch.no_grad():
                     clipfracs.append(

@@ -54,6 +54,7 @@ def main():
     agent.eval()
 
     obs, _oracle, feats, mask = env.reset()
+    h = agent.initial_state(args.num_envs, device)
     wins = losses = ties = 0
     while wins + losses + ties < args.episodes:
         # Evaluation is honest: only the hidden-information observation is
@@ -61,14 +62,18 @@ def main():
         with torch.inference_mode(), torch.autocast(
             device_type=device.type, dtype=amp_dtype, enabled=use_cuda_amp
         ):
-            action, _, _ = agent.act(
+            action, _, _, h = agent.act(
                 torch.as_tensor(obs, dtype=torch.float32, device=device),
                 None,
                 torch.as_tensor(feats, dtype=torch.float32, device=device),
                 torch.as_tensor(mask, device=device),
+                h,
                 greedy=not args.sample,
             )
         obs, _oracle, feats, mask, _, dones, outcomes = env.step(action.cpu().numpy())
+        if h is not None:
+            done_t = torch.as_tensor(dones, dtype=torch.float32, device=device)
+            h = h.clone() * (1.0 - done_t).unsqueeze(-1)
         for done, outcome in zip(dones, outcomes):
             if done:
                 if outcome > 0:

@@ -885,8 +885,13 @@ type StepArrays<'py> = (
     Bound<'py, PyArray1<u32>>,
 );
 
+type EnvWriteItem<'a> = (
+    (((&'a mut RlEnvCore, &'a mut [f32]), &'a mut [f32]), &'a mut [f32]),
+    &'a mut u32,
+);
+
 impl PyRlVecEnv {
-    fn arrays<'py>(&self, py: Python<'py>) -> StepArrays<'py> {
+    fn arrays<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
         let obs_dim = self.envs[0].obs_dim();
         let feat_dim = self.envs[0].action_feat_dim();
         let n = self.envs.len();
@@ -894,15 +899,22 @@ impl PyRlVecEnv {
         let mut oracle_obs = vec![0.0f32; n * obs_dim];
         let mut feats = vec![0.0f32; n * MAX_ACTIONS * feat_dim];
         let mut n_actions = vec![0u32; n];
-        for (i, env) in self.envs.iter().enumerate() {
-            let actor = env.pending_actor();
-            env.write_observation(&mut obs[i * obs_dim..(i + 1) * obs_dim], actor, false);
-            env.write_observation(&mut oracle_obs[i * obs_dim..(i + 1) * obs_dim], actor, true);
-            env.write_action_features(
-                &mut feats[i * MAX_ACTIONS * feat_dim..(i + 1) * MAX_ACTIONS * feat_dim],
+        // par_iter_mut: RlEnvCore is Send but not Sync (boxed dyn Player).
+        self.envs
+            .par_iter_mut()
+            .zip(obs.par_chunks_mut(obs_dim))
+            .zip(oracle_obs.par_chunks_mut(obs_dim))
+            .zip(feats.par_chunks_mut(MAX_ACTIONS * feat_dim))
+            .zip(n_actions.par_iter_mut())
+            .for_each(
+                |((((env, obs_chunk), oracle_chunk), feats_chunk), n_act): EnvWriteItem| {
+                    let actor = env.pending_actor();
+                    env.write_observation(obs_chunk, actor, false);
+                    env.write_observation(oracle_chunk, actor, true);
+                    env.write_action_features(feats_chunk);
+                    *n_act = env.num_actions() as u32;
+                },
             );
-            n_actions[i] = env.num_actions() as u32;
-        }
         (
             obs.into_pyarray_bound(py),
             oracle_obs.into_pyarray_bound(py),
@@ -1086,13 +1098,19 @@ impl PyRlVecEnv {
                 "indices and actions must have the same length",
             ));
         }
-        let mut rewards = vec![0.0f32; indices.len()];
-        let mut dones = vec![false; indices.len()];
-        let mut outcomes = vec![0i8; indices.len()];
+        // Scatter actions into a per-env slot so the disjoint subset can be
+        // stepped in parallel, then gather results back into `indices` order.
+        let mut action_of = vec![usize::MAX; self.envs.len()];
+        let mut slot_of = vec![usize::MAX; self.envs.len()];
         for (k, (&i, &action)) in indices.iter().zip(actions.iter()).enumerate() {
-            let env = self.envs.get_mut(i).ok_or_else(|| {
+            let env = self.envs.get(i).ok_or_else(|| {
                 PyErr::new::<pyo3::exceptions::PyIndexError, _>("env index out of range")
             })?;
+            if action_of[i] != usize::MAX {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "duplicate env index in step_some",
+                ));
+            }
             if action >= env.num_actions() {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "action index {} out of range ({} legal actions)",
@@ -1100,7 +1118,20 @@ impl PyRlVecEnv {
                     env.num_actions()
                 )));
             }
-            let result = env.step(action);
+            action_of[i] = action;
+            slot_of[i] = k;
+        }
+        let mut rewards = vec![0.0f32; indices.len()];
+        let mut dones = vec![false; indices.len()];
+        let mut outcomes = vec![0i8; indices.len()];
+        let results: Vec<(usize, crate::rl_env::StepResult)> = self
+            .envs
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| action_of[*i] != usize::MAX)
+            .map(|(i, env)| (slot_of[i], env.step(action_of[i])))
+            .collect();
+        for (k, result) in results {
             rewards[k] = result.reward;
             dones[k] = result.done;
             outcomes[k] = result.outcome;
@@ -1114,7 +1145,7 @@ impl PyRlVecEnv {
 
     /// Current observations/features without stepping (pending-actor
     /// perspective). Same tuple as `reset`.
-    fn observe<'py>(&self, py: Python<'py>) -> StepArrays<'py> {
+    fn observe<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
         self.arrays(py)
     }
 

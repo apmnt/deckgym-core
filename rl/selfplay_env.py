@@ -50,10 +50,18 @@ class SelfPlayVecEnv:
         self._pending_reward = np.zeros(num_envs, dtype=np.float32)
         self._pending_done = np.zeros(num_envs, dtype=bool)
         self._pending_outcome = np.zeros(num_envs, dtype=np.int8)
+        # Per-env GRU state of whichever frozen net plays seat 1 (recurrent
+        # agents only). Zeroed when an episode ends (assignments resample at
+        # the same moment, so the state never leaks across opponents).
+        self._opp_h: torch.Tensor | None = None
 
     def set_latest(self, agent: torch.nn.Module):
         """Refresh the frozen copy of the learner used as the 'latest' opponent."""
         self._latest = copy.deepcopy(agent).to(self.device).eval()
+        if getattr(agent, "gru", None) is not None and self._opp_h is None:
+            self._opp_h = torch.zeros(
+                self.num_envs, agent.gru.hidden_size, device=self.device
+            )
 
     def add_snapshot(self, agent: torch.nn.Module, max_pool: int):
         self._pool.append(copy.deepcopy(agent).to(self.device).eval())
@@ -95,6 +103,8 @@ class SelfPlayVecEnv:
                 self._pending_done[env_id] = True
                 self._pending_outcome[env_id] = outcome
                 self._resample_assignment(env_id)
+                if self._opp_h is not None:
+                    self._opp_h[env_id] = 0.0
 
     def _advance_opponents(self):
         """Play frozen-policy moves until every env awaits a seat-0 decision."""
@@ -111,20 +121,26 @@ class SelfPlayVecEnv:
             for key in np.unique(keys):
                 env_ids = waiting[keys == key]
                 net = self._opponent_net(int(key))
+                h_in = self._opp_h[env_ids] if self._opp_h is not None else None
                 with torch.inference_mode(), torch.autocast(
                     device_type=self.device.type,
                     dtype=self.amp_dtype,
                     enabled=self.amp_enabled,
                 ):
-                    actions, _, _ = net.act(
+                    actions, _, _, h_new = net.act(
                         torch.as_tensor(obs[env_ids], dtype=torch.float32, device=self.device),
                         None,
                         torch.as_tensor(feats[env_ids], dtype=torch.float32, device=self.device),
                         torch.as_tensor(mask[env_ids], device=self.device),
+                        h_in,
                     )
                 rewards, dones, outcomes = self._env.step_some(
                     [int(i) for i in env_ids], [int(a) for a in actions.cpu()]
                 )
+                # Scatter the new memory before _record, which zeroes the
+                # rows of episodes that just ended.
+                if self._opp_h is not None and h_new is not None:
+                    self._opp_h[env_ids] = h_new.float().clone()
                 self._record(env_ids, rewards, dones, outcomes)
 
     def reset(self):
@@ -132,6 +148,8 @@ class SelfPlayVecEnv:
         self._pending_reward[:] = 0.0
         self._pending_done[:] = False
         self._pending_outcome[:] = 0
+        if self._opp_h is not None:
+            self._opp_h.zero_()
         for i in range(self.num_envs):
             self._resample_assignment(i)
         self._advance_opponents()
