@@ -863,10 +863,14 @@ pub fn py_simulate(
 
 /// Vectorized RL environment over `RlEnvCore`.
 ///
-/// The agent always sits in seat 0; the opponent (a built-in bot) plays seat 1
-/// inside `step`. Episodes auto-reset, so every returned observation belongs
-/// to a live game at an agent decision point. Arrays are returned flat;
-/// reshape Python-side to `(num_envs, obs_dim)` and
+/// With a bot opponent code, the agent always sits in seat 0 and the bot plays
+/// seat 1 inside `step`. With `opponent="self"` (self-play mode) the envs
+/// pause at *both* seats' decisions: `seats()` reports who must act per env,
+/// observations are written from the pending actor's perspective, and
+/// `step_some` advances a chosen subset of envs. Rewards/outcomes are always
+/// from seat 0's perspective. Episodes auto-reset, so every returned
+/// observation belongs to a live game at a decision point. Arrays are
+/// returned flat; reshape Python-side to `(num_envs, obs_dim)` and
 /// `(num_envs, max_actions, action_feat_dim)`.
 #[pyclass(unsendable)]
 pub struct PyRlVecEnv {
@@ -890,8 +894,9 @@ impl PyRlVecEnv {
         let mut feats = vec![0.0f32; n * MAX_ACTIONS * feat_dim];
         let mut n_actions = vec![0u32; n];
         for (i, env) in self.envs.iter().enumerate() {
-            env.write_observation(&mut obs[i * obs_dim..(i + 1) * obs_dim], false);
-            env.write_observation(&mut oracle_obs[i * obs_dim..(i + 1) * obs_dim], true);
+            let actor = env.pending_actor();
+            env.write_observation(&mut obs[i * obs_dim..(i + 1) * obs_dim], actor, false);
+            env.write_observation(&mut oracle_obs[i * obs_dim..(i + 1) * obs_dim], actor, true);
             env.write_action_features(
                 &mut feats[i * MAX_ACTIONS * feat_dim..(i + 1) * MAX_ACTIONS * feat_dim],
             );
@@ -923,13 +928,18 @@ impl PyRlVecEnv {
                 "num_envs must be >= 1",
             ));
         }
-        let code = parse_player_code(opponent)
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
-        if code == PlayerCode::H {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Human opponent is not supported in the RL environment",
-            ));
-        }
+        let code = if opponent == "self" {
+            None
+        } else {
+            let code = parse_player_code(opponent)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+            if code == PlayerCode::H {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Human opponent is not supported in the RL environment",
+                ));
+            }
+            Some(code)
+        };
         let deck_a = Deck::from_file(deck_a_path).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load deck A: {}", e))
         })?;
@@ -939,9 +949,14 @@ impl PyRlVecEnv {
 
         let envs = (0..num_envs)
             .map(|i| {
-                let players =
-                    create_players(deck_a.clone(), deck_b.clone(), vec![code.clone(), code.clone()]);
-                let opponent_player = players.into_iter().nth(1).unwrap();
+                let opponent_player = code.clone().map(|code| {
+                    let players = create_players(
+                        deck_a.clone(),
+                        deck_b.clone(),
+                        vec![code.clone(), code],
+                    );
+                    players.into_iter().nth(1).unwrap()
+                });
                 RlEnvCore::new(
                     deck_a.clone(),
                     deck_b.clone(),
@@ -1037,6 +1052,67 @@ impl PyRlVecEnv {
             dones.into_pyarray_bound(py),
             outcomes.into_pyarray_bound(py),
         ))
+    }
+
+    /// Seat that must act next in each env (always 0 with a bot opponent).
+    fn seats<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
+        self.envs
+            .iter()
+            .map(|env| env.pending_actor() as u32)
+            .collect::<Vec<_>>()
+            .into_pyarray_bound(py)
+    }
+
+    /// Step only the envs in `indices` (self-play mode). Returns
+    /// (rewards, dones, outcomes) aligned with `indices`, seat-0 perspective.
+    /// Call `reset`/`arrays` semantics as usual: fresh observations for all
+    /// envs come from the next `observe` call.
+    #[allow(clippy::type_complexity)]
+    fn step_some<'py>(
+        &mut self,
+        py: Python<'py>,
+        indices: Vec<usize>,
+        actions: Vec<usize>,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<i8>>,
+    )> {
+        if indices.len() != actions.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "indices and actions must have the same length",
+            ));
+        }
+        let mut rewards = vec![0.0f32; indices.len()];
+        let mut dones = vec![false; indices.len()];
+        let mut outcomes = vec![0i8; indices.len()];
+        for (k, (&i, &action)) in indices.iter().zip(actions.iter()).enumerate() {
+            let env = self.envs.get_mut(i).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyIndexError, _>("env index out of range")
+            })?;
+            if action >= env.num_actions() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "action index {} out of range ({} legal actions)",
+                    action,
+                    env.num_actions()
+                )));
+            }
+            let result = env.step(action);
+            rewards[k] = result.reward;
+            dones[k] = result.done;
+            outcomes[k] = result.outcome;
+        }
+        Ok((
+            rewards.into_pyarray_bound(py),
+            dones.into_pyarray_bound(py),
+            outcomes.into_pyarray_bound(py),
+        ))
+    }
+
+    /// Current observations/features without stepping (pending-actor
+    /// perspective). Same tuple as `reset`.
+    fn observe<'py>(&self, py: Python<'py>) -> StepArrays<'py> {
+        self.arrays(py)
     }
 
     /// Human-readable legal actions of one environment (for debugging).

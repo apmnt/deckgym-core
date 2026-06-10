@@ -108,10 +108,11 @@ fn action_card(action: &SimpleAction) -> Option<Card> {
     }
 }
 
-/// (in_play_idx, targets_opponent) referenced by an action, if any.
-fn action_target(action: &SimpleAction) -> Option<(usize, bool)> {
+/// (in_play_idx, target_player) referenced by an action, if any. The player
+/// is `None` for actions that implicitly target the actor's own side.
+fn action_target(action: &SimpleAction) -> Option<(usize, Option<usize>)> {
     match action {
-        SimpleAction::Place(_, idx) => Some((*idx, false)),
+        SimpleAction::Place(_, idx) => Some((*idx, None)),
         SimpleAction::Evolve { in_play_idx, .. }
         | SimpleAction::UseAbility { in_play_idx }
         | SimpleAction::AttachTool { in_play_idx, .. }
@@ -121,24 +122,24 @@ fn action_target(action: &SimpleAction) -> Option<(usize, bool)> {
         | SimpleAction::DiscardFossil { in_play_idx }
         | SimpleAction::ReturnPokemonToHand { in_play_idx }
         | SimpleAction::ShuffleInPlayPokemonIntoDeck { in_play_idx } => {
-            Some((*in_play_idx, false))
+            Some((*in_play_idx, None))
         }
-        SimpleAction::Retreat(idx) => Some((*idx, false)),
-        SimpleAction::Activate { in_play_idx, .. } => Some((*in_play_idx, false)),
-        SimpleAction::MoveEnergy { to_in_play_idx, .. } => Some((*to_in_play_idx, false)),
+        SimpleAction::Retreat(idx) => Some((*idx, None)),
+        SimpleAction::Activate { in_play_idx, .. } => Some((*in_play_idx, None)),
+        SimpleAction::MoveEnergy { to_in_play_idx, .. } => Some((*to_in_play_idx, None)),
         SimpleAction::Attach { attachments, .. } => {
-            attachments.first().map(|(_, _, idx)| (*idx, false))
+            attachments.first().map(|(_, _, idx)| (*idx, None))
         }
         SimpleAction::ApplyDamage { targets, .. } => targets
             .first()
-            .map(|(_, target_player, idx)| (*idx, *target_player == 1)),
+            .map(|(_, target_player, idx)| (*idx, Some(*target_player))),
         SimpleAction::ScheduleDelayedSpotDamage {
             target_player,
             target_in_play_idx,
             ..
-        } => Some((*target_in_play_idx, *target_player == 1)),
+        } => Some((*target_in_play_idx, Some(*target_player))),
         SimpleAction::DiscardToolFromPokemon { player, in_play_idx } => {
-            Some((*in_play_idx, *player == 1))
+            Some((*in_play_idx, Some(*player)))
         }
         _ => None,
     }
@@ -222,15 +223,22 @@ impl CardVocab {
     }
 }
 
-/// Single-agent RL view of one game. Agent is always seat 0.
+/// Single-agent RL view of one game.
+///
+/// With an opponent bot (`opponent: Some(..)`), the learner is seat 0 and the
+/// bot plays seat 1 inside `step`. With `opponent: None` (self-play mode) the
+/// env pauses at *every* non-forced decision and reports whose turn it is via
+/// `pending_actor`; the caller supplies both seats' actions. Rewards and
+/// outcomes are always from seat 0's perspective.
 pub struct RlEnvCore {
     deck_a: Deck,
     deck_b: Deck,
-    opponent: Box<dyn Player>,
+    opponent: Option<Box<dyn Player>>,
     vocab: CardVocab,
     rng: StdRng,
     state: State,
     pending_actions: Vec<Action>,
+    pending_actor: usize,
     /// Potential-based shaping coefficient on the point differential (0 = pure win/loss).
     shaping_coef: f32,
     prev_potential: f32,
@@ -251,7 +259,7 @@ impl RlEnvCore {
     pub fn new(
         deck_a: Deck,
         deck_b: Deck,
-        opponent: Box<dyn Player>,
+        opponent: Option<Box<dyn Player>>,
         seed: u64,
         shaping_coef: f32,
     ) -> Self {
@@ -264,6 +272,7 @@ impl RlEnvCore {
             rng: StdRng::seed_from_u64(seed),
             state: State::default(),
             pending_actions: Vec::new(),
+            pending_actor: AGENT,
             shaping_coef,
             prev_potential: 0.0,
         };
@@ -289,6 +298,11 @@ impl RlEnvCore {
         self.pending_actions.len()
     }
 
+    /// Seat that must act next (always `AGENT` when an opponent bot is set).
+    pub fn pending_actor(&self) -> usize {
+        self.pending_actor
+    }
+
     pub fn legal_action_strings(&self) -> Vec<String> {
         self.pending_actions
             .iter()
@@ -307,10 +321,11 @@ impl RlEnvCore {
         debug_assert!(!self.state.is_game_over());
     }
 
-    /// Apply the `idx`-th legal action, then roll the game forward (opponent
-    /// moves and forced actions) until the agent must decide again or the
-    /// game ends. Resets automatically when the episode ends, so the env is
-    /// always left at a decision point of a live game.
+    /// Apply the `idx`-th legal action for the pending actor, then roll the
+    /// game forward (bot moves and forced actions) until someone must decide
+    /// again or the game ends. Resets automatically when the episode ends, so
+    /// the env is always left at a decision point of a live game. Rewards and
+    /// outcomes are from seat 0's perspective regardless of who acted.
     pub fn step(&mut self, idx: usize) -> StepResult {
         assert!(
             idx < self.pending_actions.len(),
@@ -358,9 +373,11 @@ impl RlEnvCore {
             let (actor, actions) = self.state.generate_possible_actions();
             if actions.len() == 1 {
                 apply_action(&mut self.rng, &mut self.state, &actions[0]);
-            } else if actor == OPPONENT {
+            } else if actor == OPPONENT && self.opponent.is_some() {
                 let action = self
                     .opponent
+                    .as_mut()
+                    .unwrap()
                     .decision_fn(&mut self.rng, &self.state, &actions);
                 apply_action(&mut self.rng, &mut self.state, &action);
             } else {
@@ -370,31 +387,35 @@ impl RlEnvCore {
                     actions.len()
                 );
                 self.pending_actions = actions;
+                self.pending_actor = actor;
                 return;
             }
         }
     }
 
-    /// Write the observation into `out` (must be `obs_dim()` long).
+    /// Write the observation from `perspective`'s point of view into `out`
+    /// (must be `obs_dim()` long): "my" sections come first, "theirs" second.
     ///
     /// With `include_hidden = false` the sections a real player cannot see —
-    /// the opponent's hand contents and deck composition — are left zeroed
+    /// the other seat's hand contents and deck composition — are left zeroed
     /// (hand/deck *sizes* stay visible in the globals). The oracle variant
     /// (`include_hidden = true`) is intended for a training-time critic.
-    pub fn write_observation(&self, out: &mut [f32], include_hidden: bool) {
+    pub fn write_observation(&self, out: &mut [f32], perspective: usize, include_hidden: bool) {
         debug_assert_eq!(out.len(), self.obs_dim());
         out.fill(0.0);
         let state = &self.state;
+        let me = perspective;
+        let them = 1 - perspective;
         let v = self.vocab.len();
         let mut i = 0;
 
         // Globals (58)
-        out[i] = state.points[AGENT] as f32 / MAX_POINTS;
-        out[i + 1] = state.points[OPPONENT] as f32 / MAX_POINTS;
+        out[i] = state.points[me] as f32 / MAX_POINTS;
+        out[i + 1] = state.points[them] as f32 / MAX_POINTS;
         out[i + 2] = state.turn_count as f32 / MAX_TURNS;
         out[i + 3] = (state.turn_count <= 2) as u8 as f32;
         i += 4;
-        for player in [AGENT, OPPONENT] {
+        for player in [me, them] {
             let zone = &state.energy_zone[player];
             if let Some(energy) = zone.current {
                 out[i + energy_index(energy)] = 1.0;
@@ -407,7 +428,7 @@ impl RlEnvCore {
             }
             i += NUM_ENERGY_TYPES + 1;
         }
-        for player in [AGENT, OPPONENT] {
+        for player in [me, them] {
             out[i] = state.hands[player].len() as f32 / 10.0;
             out[i + 1] = state.decks[player].cards.len() as f32 / 20.0;
             out[i + 2] = state.discard_piles[player].len() as f32 / 20.0;
@@ -417,11 +438,11 @@ impl RlEnvCore {
         out[i + 1] = state.has_retreated as u8 as f32;
         i += 2;
         out[i] = state.active_stadium.is_some() as u8 as f32;
-        out[i + 1] = (state.active_stadium_owner == Some(AGENT)) as u8 as f32;
+        out[i + 1] = (state.active_stadium_owner == Some(me)) as u8 as f32;
         i += 2;
 
-        // Board slots: agent's 4 then opponent's 4, (23 + V) each
-        for player in [AGENT, OPPONENT] {
+        // Board slots: my 4 then theirs, (23 + V) each
+        for player in [me, them] {
             for slot in 0..NUM_SLOTS {
                 if let Some(played) = &state.in_play_pokemon[player][slot] {
                     out[i] = 1.0;
@@ -456,19 +477,19 @@ impl RlEnvCore {
         }
 
         // Card counts per vocab entry: hands, discards, decks (6 × V).
-        // The opponent's hand and deck composition are hidden information.
-        for player in [AGENT, OPPONENT] {
-            if player == AGENT || include_hidden {
+        // The other seat's hand and deck composition are hidden information.
+        for player in [me, them] {
+            if player == me || include_hidden {
                 count_cards(&state.hands[player], &self.vocab, &mut out[i..i + v]);
             }
             i += v;
         }
-        for player in [AGENT, OPPONENT] {
+        for player in [me, them] {
             count_cards(&state.discard_piles[player], &self.vocab, &mut out[i..i + v]);
             i += v;
         }
-        for player in [AGENT, OPPONENT] {
-            if player == AGENT || include_hidden {
+        for player in [me, them] {
+            if player == me || include_hidden {
                 count_cards(&state.decks[player].cards, &self.vocab, &mut out[i..i + v]);
             }
             i += v;
@@ -493,11 +514,12 @@ impl RlEnvCore {
                 }
             }
             j += v;
-            if let Some((idx, opponent_side)) = action_target(simple) {
+            if let Some((idx, target_player)) = action_target(simple) {
                 if idx < NUM_SLOTS {
                     row[j + idx] = 1.0;
                 }
-                row[j + NUM_SLOTS] = opponent_side as u8 as f32;
+                let other_side = target_player.is_some_and(|p| p != self.pending_actor);
+                row[j + NUM_SLOTS] = other_side as u8 as f32;
             }
             j += NUM_SLOTS + 1;
             if let SimpleAction::Attack(attack_idx) = simple {
@@ -540,7 +562,7 @@ mod tests {
     fn make_env(seed: u64) -> RlEnvCore {
         let deck = Deck::from_file("example_decks/venusaur-exeggutor.txt").unwrap();
         let opponent = Box::new(RandomPlayer { deck: deck.clone() });
-        RlEnvCore::new(deck.clone(), deck, opponent, seed, 0.0)
+        RlEnvCore::new(deck.clone(), deck, Some(opponent), seed, 0.0)
     }
 
     #[test]
@@ -556,12 +578,12 @@ mod tests {
         let mut steps = 0;
         while episodes < 20 {
             assert!(env.num_actions() >= 2, "env must pause on real decisions");
-            env.write_observation(&mut obs, false);
+            env.write_observation(&mut obs, AGENT, false);
             env.write_action_features(&mut feats);
             assert!(obs.iter().all(|x| x.is_finite()));
             // The hidden (policy) view must reveal no more than the oracle view.
             let mut oracle = vec![0.0; obs_dim];
-            env.write_observation(&mut oracle, true);
+            env.write_observation(&mut oracle, AGENT, true);
             assert!(obs.iter().zip(&oracle).all(|(p, o)| *p == 0.0 || p == o));
             let idx = rng.gen_range(0..env.num_actions());
             let result = env.step(idx);
@@ -578,11 +600,40 @@ mod tests {
     }
 
     #[test]
+    fn test_selfplay_mode_pauses_at_both_seats() {
+        let deck = Deck::from_file("example_decks/venusaur-exeggutor.txt").unwrap();
+        let mut env = RlEnvCore::new(deck.clone(), deck, None, 5, 0.0);
+        let mut rng = StdRng::seed_from_u64(17);
+        let mut seen_seats = [false, false];
+        let mut episodes = 0;
+        let mut steps = 0;
+        let mut obs = vec![0.0; env.obs_dim()];
+        while episodes < 10 {
+            let actor = env.pending_actor();
+            seen_seats[actor] = true;
+            // Perspective view must be valid for whoever acts.
+            env.write_observation(&mut obs, actor, false);
+            assert!(obs.iter().all(|x| x.is_finite()));
+            let idx = rng.gen_range(0..env.num_actions());
+            let result = env.step(idx);
+            if result.done {
+                episodes += 1;
+            }
+            steps += 1;
+            assert!(steps < 30_000, "episodes should terminate");
+        }
+        assert!(
+            seen_seats[AGENT] && seen_seats[OPPONENT],
+            "self-play mode must pause for both seats"
+        );
+    }
+
+    #[test]
     fn test_shaping_telescopes() {
         // With shaping, an episode's total reward must still equal the outcome.
         let deck = Deck::from_file("example_decks/venusaur-exeggutor.txt").unwrap();
         let opponent = Box::new(RandomPlayer { deck: deck.clone() });
-        let mut env = RlEnvCore::new(deck.clone(), deck, opponent, 11, 0.5);
+        let mut env = RlEnvCore::new(deck.clone(), deck, Some(opponent), 11, 0.5);
         let mut rng = StdRng::seed_from_u64(3);
         for _ in 0..5 {
             let mut episode_reward = 0.0;
@@ -611,8 +662,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(9);
         for _ in 0..200 {
             assert_eq!(env_a.num_actions(), env_b.num_actions());
-            env_a.write_observation(&mut obs_a, true);
-            env_b.write_observation(&mut obs_b, true);
+            env_a.write_observation(&mut obs_a, AGENT, true);
+            env_b.write_observation(&mut obs_b, AGENT, true);
             assert_eq!(obs_a, obs_b);
             let idx = rng.gen_range(0..env_a.num_actions());
             let result_a = env_a.step(idx);

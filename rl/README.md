@@ -32,6 +32,17 @@ Opponent codes are the engine's player codes: `r` random, `w` weighted-random,
 `aa` attach-attack, `et` end-turn, `v` value-function, `e<N>` expectiminimax
 of depth N, `m` MCTS.
 
+```bash
+# Phase 4: self-play with a historical opponent pool (fictitious self-play)
+.venv/bin/python rl/train_selfplay.py --resume rl/checkpoints/hidden_info_stage2.pt
+```
+
+In self-play the learner (seat 0) faces frozen policies in seat 1: a copy of
+its latest weights with `--latest-prob`, otherwise a uniform sample from a
+pool snapshotted every `--snapshot-every` updates. The logged win rate hovers
+near 50% by construction — measure progress with `rl/eval.py` against fixed
+opponents.
+
 ## Evaluate
 
 ```bash
