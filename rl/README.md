@@ -11,21 +11,21 @@ ygo-agent / DouZero pattern) — no global flat action space is needed.
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install maturin numpy
-.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/maturin develop --release   # builds the deckgym extension with the rl env
+uv venv
+uv pip install maturin numpy
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+uv run maturin develop --release   # builds the deckgym extension with the rl env
 ```
 
 ## Train
 
 ```bash
 # Phase 1: beat the random player
-.venv/bin/python rl/train_ppo.py --opponent r --total-steps 2000000
+uv run python rl/train_ppo.py --opponent r --total-steps 2000000
 
 # Phase 2/3: harder built-in opponents
-.venv/bin/python rl/train_ppo.py --opponent v  --resume runs/<run>/latest.pt
-.venv/bin/python rl/train_ppo.py --opponent e2 --resume runs/<run>/latest.pt
+uv run python rl/train_ppo.py --opponent v  --resume runs/<run>/latest.pt
+uv run python rl/train_ppo.py --opponent e2 --resume runs/<run>/latest.pt
 ```
 
 Opponent codes are the engine's player codes: `r` random, `w` weighted-random,
@@ -34,7 +34,7 @@ of depth N, `m` MCTS.
 
 ```bash
 # Phase 4: self-play with a historical opponent pool (fictitious self-play)
-.venv/bin/python rl/train_selfplay.py --resume rl/checkpoints/hidden_info_stage2.pt
+uv run python rl/train_selfplay.py --resume rl/checkpoints/hidden_info_stage2.pt
 ```
 
 In self-play the learner (seat 0) faces frozen policies in seat 1: a copy of
@@ -46,7 +46,7 @@ opponents.
 ## Evaluate
 
 ```bash
-.venv/bin/python rl/eval.py runs/<run>/latest.pt --opponent r --episodes 500
+uv run python rl/eval.py runs/<run>/latest.pt --opponent r --episodes 500
 ```
 
 ## Design notes
