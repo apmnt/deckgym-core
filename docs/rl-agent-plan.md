@@ -78,23 +78,27 @@ benefits from more cores; the code stays CPU-friendly (small MLPs).
 
 ## Results — hidden-information agent, venusaur-exeggutor mirror
 
-Curriculum: 400k steps vs `r` → 250k vs `v` (cut at plateau) → 600k vs `e2`.
-Greedy-policy evals; the e2 number pools 364 episodes across seeds. The
-checkpoint is `rl/checkpoints/hidden_info_stage2.pt`.
+Curriculum: 400k steps vs `r` → 250k vs `v` (cut at plateau) → 3M steps of
+fictitious self-play (pool of 20 snapshots, latest-prob 0.5), resumed from
+the stage-2 weights. Greedy-policy evals; e2 numbers pool 364–400 episodes
+across seeds. Checkpoints: `rl/checkpoints/hidden_info_stage2.pt` (before
+self-play) and `rl/checkpoints/selfplay_3m.pt` (final, best).
 
-| Opponent | Win rate | Notes |
-|---|---|---|
-| `r` random | 100% | |
-| `v` value-function | ~96% | opponent sees the agent's hand; agent does not |
-| `e2` expectiminimax-2 | ~44% | near-parity against an open-hand searcher |
+| Opponent | stage 2 | + self-play | Notes |
+|---|---|---|---|
+| `r` random | 100% | 100% | |
+| `v` value-function | ~96% | ~97% | opponent sees the agent's hand; agent does not |
+| `e2` expectiminimax-2 | ~44% | **~49%** | parity with an open-hand searcher |
 
 Lessons so far:
 
 - The stage-3 fine-tune *directly against e2* did not improve on the stage-2
   checkpoint (paired-seed evals put it ~4pp worse) — sparse ±1 rewards
-  against a much stronger opponent stall; next levers are point-differential
-  shaping during that stage, mixed-opponent training, or going straight to
-  self-play with an opponent pool (phase 5).
+  against a much stronger opponent stall. **Self-play with a historical pool
+  is what worked**: +5pp vs e2 (44% → 49%) with no forgetting vs r/v, while
+  the in-training self-play win rate stayed near 50% throughout (as it
+  must). The midpoint probe at 1.4M steps was still flat vs e2 — the gain
+  materialized in the second half; don't judge self-play runs early.
 - Hiding the opponent's hand barely slowed early learning (stage 1 reached
   99% vs random on the same schedule as the open-hand run), and the oracle
   critic carried stage 2 to ~96% vs `v`.
