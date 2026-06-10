@@ -68,6 +68,17 @@ def parse_args():
     p.add_argument("--latest-prob", type=float, default=0.5)
     p.add_argument("--pool-size", type=int, default=20)
     p.add_argument("--snapshot-every", type=int, default=15, help="updates between pool snapshots")
+    p.add_argument(
+        "--bots",
+        default="",
+        help="comma-separated engine bots mixed into the opponent roster, e.g. e1,e2,e3",
+    )
+    p.add_argument(
+        "--pfsp-power",
+        type=float,
+        default=2.0,
+        help="PFSP exponent: opponents sampled with prob ∝ (1-winrate)^power",
+    )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
     p.add_argument("--amp", action="store_true", help="use autocast on CUDA")
@@ -101,6 +112,8 @@ def main():
         device=device,
         amp_enabled=use_cuda_amp,
         amp_dtype=amp_dtype,
+        bot_opponents=[b for b in args.bots.split(",") if b],
+        pfsp_power=args.pfsp_power,
     )
     if args.resume:
         # The checkpoint dictates the architecture; --arch/--hidden are ignored.
@@ -304,6 +317,13 @@ def main():
             f"clipfrac={mean_clipfrac:.3f} sps={sps}",
             flush=True,
         )
+        if update % 10 == 0:
+            stats = env.opponent_stats()
+            if stats:
+                summary = " ".join(
+                    f"{name}={wr:.2f}({n})" for name, (wr, n) in stats.items()
+                )
+                print(f"  arms: {summary}", flush=True)
         save_agent_state(raw_agent, run_dir / "latest.pt")
 
     save_agent_state(raw_agent, run_dir / "final.pt")

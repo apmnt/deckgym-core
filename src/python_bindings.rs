@@ -876,6 +876,8 @@ pub fn py_simulate(
 #[pyclass(unsendable)]
 pub struct PyRlVecEnv {
     envs: Vec<RlEnvCore>,
+    deck_a: Deck,
+    deck_b: Deck,
 }
 
 type StepArrays<'py> = (
@@ -976,7 +978,11 @@ impl PyRlVecEnv {
                 )
             })
             .collect();
-        Ok(PyRlVecEnv { envs })
+        Ok(PyRlVecEnv {
+            envs,
+            deck_a,
+            deck_b,
+        })
     }
 
     fn num_envs(&self) -> usize {
@@ -1147,6 +1153,50 @@ impl PyRlVecEnv {
     /// perspective). Same tuple as `reset`.
     fn observe<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
         self.arrays(py)
+    }
+
+    /// Ask an engine bot (player code, e.g. "e2") to choose an action for
+    /// each env in `indices`, returning chosen legal-action indices aligned
+    /// with `indices`. Does not step the envs. Runs bots in parallel — used
+    /// to mix engine bots into the self-play opponent roster.
+    fn bot_decide_many(&mut self, indices: Vec<usize>, code: &str) -> PyResult<Vec<usize>> {
+        let code =
+            parse_player_code(code).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        let mut slot_of = vec![usize::MAX; self.envs.len()];
+        for (k, &i) in indices.iter().enumerate() {
+            if i >= self.envs.len() {
+                return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
+                    "env index out of range",
+                ));
+            }
+            if slot_of[i] != usize::MAX {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "duplicate env index in bot_decide_many",
+                ));
+            }
+            slot_of[i] = k;
+        }
+        let deck_a = &self.deck_a;
+        let deck_b = &self.deck_b;
+        let picks: Vec<(usize, usize)> = self
+            .envs
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| slot_of[*i] != usize::MAX)
+            .map(|(i, env)| {
+                let mut bot =
+                    create_players(deck_a.clone(), deck_b.clone(), vec![code.clone(), code.clone()])
+                        .into_iter()
+                        .nth(1)
+                        .unwrap();
+                (slot_of[i], env.decide_with(bot.as_mut()))
+            })
+            .collect();
+        let mut out = vec![0usize; indices.len()];
+        for (k, idx) in picks {
+            out[k] = idx;
+        }
+        Ok(out)
     }
 
     /// Human-readable legal actions of one environment (for debugging).

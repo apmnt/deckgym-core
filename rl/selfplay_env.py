@@ -1,24 +1,33 @@
-"""Self-play vec-env: learner in seat 0, frozen policies in seat 1.
+"""Self-play vec-env: learner in seat 0, frozen policies or engine bots in seat 1.
 
 Wraps `PyRlVecEnv(opponent="self")`, which pauses at *both* seats'
-decisions. This wrapper drives seat 1 with frozen opponent networks — a
-copy of the latest learner weights or a snapshot from a historical pool,
-sampled per episode — so the PPO loop sees the exact single-agent interface
-of `VecEnv`: every `step(actions)` consumes seat-0 actions for all envs and
-returns the next seat-0 decision, with rewards/dones accumulated across any
-interleaved opponent moves.
+decisions. This wrapper drives seat 1 with a per-episode opponent — a copy
+of the latest learner weights, a snapshot from a historical pool, or an
+engine bot (e.g. e1/e2/e3) decided in Rust — so the PPO loop sees the exact
+single-agent interface of `VecEnv`: every `step(actions)` consumes seat-0
+actions for all envs and returns the next seat-0 decision, with rewards and
+dones accumulated across any interleaved opponent moves.
 
-Opponents play honestly: they get the hidden-information observation from
-their own perspective and sample (rather than argmax) for diversity.
+Opponent selection is PFSP (prioritized fictitious self-play, AlphaStar
+style): with `latest_prob` the opponent is the latest learner copy
+(self-play anchor); otherwise pool snapshots and bots are sampled with
+probability ∝ (1 - winrate)^pfsp_power, focusing training on the opponents
+the learner still loses to.
+
+Frozen-net opponents play honestly: they get the hidden-information
+observation from their own perspective and sample (rather than argmax) for
+diversity. Engine bots see everything, as they always do.
 """
 
 import copy
+from collections import deque
 
 import numpy as np
 import torch
 from deckgym import PyRlVecEnv
 
 LATEST = -1  # assignment key for "frozen copy of current learner"
+BOT_BASE = -2  # bot j is encoded as BOT_BASE - j
 
 
 class SelfPlayVecEnv:
@@ -33,6 +42,8 @@ class SelfPlayVecEnv:
         device: str | torch.device = "cpu",
         amp_enabled: bool = False,
         amp_dtype: torch.dtype = torch.bfloat16,
+        bot_opponents: list[str] | None = None,
+        pfsp_power: float = 2.0,
     ):
         self._env = PyRlVecEnv(deck_a, deck_b, "self", num_envs, seed, shaping_coef)
         self.num_envs = num_envs
@@ -43,8 +54,13 @@ class SelfPlayVecEnv:
         self.device = torch.device(device)
         self.amp_enabled = amp_enabled and self.device.type == "cuda"
         self.amp_dtype = amp_dtype
+        self.bot_opponents = list(bot_opponents or [])
+        self.pfsp_power = pfsp_power
         self._latest: torch.nn.Module | None = None
         self._pool: list[torch.nn.Module] = []
+        # Learner outcomes (1 win / 0.5 tie / 0 loss) per opponent arm,
+        # rolling window; drives the PFSP sampling weights.
+        self._results: dict[int, deque[float]] = {}
         self._rng = np.random.default_rng(seed)
         self._assignments = np.full(num_envs, LATEST, dtype=np.int64)
         self._pending_reward = np.zeros(num_envs, dtype=np.float32)
@@ -67,27 +83,59 @@ class SelfPlayVecEnv:
         self._pool.append(copy.deepcopy(agent).to(self.device).eval())
         if len(self._pool) > max_pool:
             self._pool.pop(0)
-            # Pool indices shifted down; remap live assignments.
+            # Pool indices shifted down; remap live assignments and stats.
             self._assignments = np.where(
                 self._assignments > 0,
                 self._assignments - 1,
                 np.where(self._assignments == 0, LATEST, self._assignments),
             )
+            self._results = {
+                (key - 1 if key > 0 else key): res
+                for key, res in self._results.items()
+                if key != 0
+            }
 
     @property
     def pool_size(self) -> int:
         return len(self._pool)
 
+    def _winrate(self, key: int) -> float:
+        results = self._results.get(key)
+        if not results or len(results) < 8:
+            return 0.5  # unexplored arms sample at the neutral weight
+        return sum(results) / len(results)
+
     def _resample_assignment(self, i: int):
-        if self._pool and self._rng.random() > self.latest_prob:
-            self._assignments[i] = self._rng.integers(len(self._pool))
-        else:
+        arms = list(range(len(self._pool))) + [
+            BOT_BASE - j for j in range(len(self.bot_opponents))
+        ]
+        if not arms or self._rng.random() < self.latest_prob:
             self._assignments[i] = LATEST
+            return
+        # PFSP: focus on opponents the learner still loses to.
+        weights = np.array(
+            [(1.0 - self._winrate(key)) ** self.pfsp_power + 0.05 for key in arms]
+        )
+        self._assignments[i] = self._rng.choice(arms, p=weights / weights.sum())
 
     def _opponent_net(self, key: int) -> torch.nn.Module:
         net = self._latest if key == LATEST else self._pool[key]
         assert net is not None, "call set_latest() before stepping"
         return net
+
+    def opponent_stats(self) -> dict[str, tuple[float, int]]:
+        """Learner winrate and sample count per arm (for logging)."""
+        stats = {}
+        for key, results in sorted(self._results.items()):
+            if key == LATEST:
+                name = "latest"
+            elif key <= BOT_BASE:
+                name = self.bot_opponents[BOT_BASE - key]
+            else:
+                name = f"pool{key}"
+            if results:
+                stats[name] = (sum(results) / len(results), len(results))
+        return stats
 
     def _unpack(self, obs, oracle_obs, feats, n_actions):
         obs = obs.reshape(self.num_envs, self.obs_dim)
@@ -102,6 +150,10 @@ class SelfPlayVecEnv:
             if done:
                 self._pending_done[env_id] = True
                 self._pending_outcome[env_id] = outcome
+                arm = int(self._assignments[env_id])
+                self._results.setdefault(arm, deque(maxlen=64)).append(
+                    1.0 if outcome > 0 else 0.0 if outcome < 0 else 0.5
+                )
                 self._resample_assignment(env_id)
                 if self._opp_h is not None:
                     self._opp_h[env_id] = 0.0
@@ -120,6 +172,14 @@ class SelfPlayVecEnv:
             keys = self._assignments[waiting].copy()
             for key in np.unique(keys):
                 env_ids = waiting[keys == key]
+                if key <= BOT_BASE:
+                    # Engine-bot opponent: the decision is made in Rust.
+                    code = self.bot_opponents[BOT_BASE - int(key)]
+                    ids = [int(i) for i in env_ids]
+                    bot_actions = self._env.bot_decide_many(ids, code)
+                    rewards, dones, outcomes = self._env.step_some(ids, bot_actions)
+                    self._record(env_ids, rewards, dones, outcomes)
+                    continue
                 net = self._opponent_net(int(key))
                 h_in = self._opp_h[env_ids] if self._opp_h is not None else None
                 with torch.inference_mode(), torch.autocast(

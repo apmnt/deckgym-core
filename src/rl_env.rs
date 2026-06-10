@@ -303,6 +303,17 @@ impl RlEnvCore {
         self.pending_actor
     }
 
+    /// Ask an external bot to choose among the pending actions, returning
+    /// the chosen index (does not step the env). Used in self-play mode to
+    /// mix engine bots into the opponent roster without installing them.
+    pub fn decide_with(&mut self, player: &mut dyn Player) -> usize {
+        let action = player.decision_fn(&mut self.rng, &self.state, &self.pending_actions);
+        self.pending_actions
+            .iter()
+            .position(|a| *a == action)
+            .expect("bot returned an action that is not in the legal list")
+    }
+
     pub fn legal_action_strings(&self) -> Vec<String> {
         self.pending_actions
             .iter()
