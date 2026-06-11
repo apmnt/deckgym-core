@@ -44,6 +44,11 @@ def parse_args():
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--memory", action="store_true", help="GRU agent (trained stateless in BC)")
+    p.add_argument(
+        "--oracle",
+        action="store_true",
+        help="all-knowing policy: train on the full-state view (like the demonstrator)",
+    )
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -127,6 +132,9 @@ def main():
         f"demonstrator seat-0 win rate {np.mean(outcomes > 0):.3f}"
     )
 
+    if args.oracle and args.aux_belief > 0:
+        print("oracle policy sees everything; disabling --aux-belief")
+        args.aux_belief = 0.0
     agent = make_agent(
         obs_dim,
         feat_dim,
@@ -136,6 +144,7 @@ def main():
         args.heads,
         memory=args.memory,
         belief=args.aux_belief > 0,
+        oracle=args.oracle,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 
@@ -147,7 +156,10 @@ def main():
             batch = [samples[j] for j in indices[s : s + args.batch_size]]
             n_max = max(len(rec[2]) for rec in batch)
             bsz = len(batch)
-            obs_b = torch.from_numpy(np.stack([rec[0] for rec in batch])).to(device)
+            # rec = (obs, oracle, feats, action, outcome); oracle agents
+            # train the policy on the full-state view like the demonstrator.
+            pol_field = 1 if args.oracle else 0
+            obs_b = torch.from_numpy(np.stack([rec[pol_field] for rec in batch])).to(device)
             oracle_b = torch.from_numpy(np.stack([rec[1] for rec in batch])).to(device)
             feats_b = torch.zeros(bsz, n_max, feat_dim, device=device)
             mask_b = torch.zeros(bsz, n_max, dtype=torch.bool, device=device)

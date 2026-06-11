@@ -165,7 +165,7 @@ class SelfPlayVecEnv:
             waiting = np.flatnonzero(seats == 1)
             if waiting.size == 0:
                 return
-            obs, _, feats, mask = self._unpack(*self._env.observe())
+            obs, oracle, feats, mask = self._unpack(*self._env.observe())
             # Snapshot the grouping: stepping a group can finish an episode
             # and resample that env's assignment, which must not re-enter a
             # later group within this pass (its observation would be stale).
@@ -181,6 +181,9 @@ class SelfPlayVecEnv:
                     self._record(env_ids, rewards, dones, outcomes)
                     continue
                 net = self._opponent_net(int(key))
+                # Oracle agents play with the full-state view; honest agents
+                # get the hidden-information view from their own perspective.
+                view = oracle if net.config.get("oracle", False) else obs
                 h_in = self._opp_h[env_ids] if self._opp_h is not None else None
                 with torch.inference_mode(), torch.autocast(
                     device_type=self.device.type,
@@ -188,7 +191,7 @@ class SelfPlayVecEnv:
                     enabled=self.amp_enabled,
                 ):
                     actions, _, _, h_new = net.act(
-                        torch.as_tensor(obs[env_ids], dtype=torch.float32, device=self.device),
+                        torch.as_tensor(view[env_ids], dtype=torch.float32, device=self.device),
                         None,
                         torch.as_tensor(feats[env_ids], dtype=torch.float32, device=self.device),
                         torch.as_tensor(mask[env_ids], device=self.device),

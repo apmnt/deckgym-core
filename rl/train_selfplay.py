@@ -83,6 +83,11 @@ def parse_args():
         "--memory", action="store_true", help="GRU over decision steps (res/tx arch)"
     )
     p.add_argument(
+        "--oracle",
+        action="store_true",
+        help="all-knowing policy: feeds the full-state view to the policy too",
+    )
+    p.add_argument(
         "--aux-belief",
         type=float,
         default=0.0,
@@ -145,6 +150,7 @@ def main():
             args.resume, env.obs_dim, env.act_feat_dim, map_location=device
         ).to(device)
         args.memory = getattr(raw_agent, "gru", None) is not None
+        args.oracle = raw_agent.config.get("oracle", False)
         if args.aux_belief > 0 and getattr(raw_agent, "belief_head", None) is None:
             print("checkpoint has no belief head; disabling --aux-belief")
             args.aux_belief = 0.0
@@ -159,7 +165,13 @@ def main():
             args.heads,
             memory=args.memory,
             belief=args.aux_belief > 0,
+            oracle=args.oracle,
         ).to(device)
+    if args.oracle and args.aux_belief > 0:
+        print("oracle policy sees everything; disabling --aux-belief")
+        args.aux_belief = 0.0
+    if args.oracle:
+        print("ORACLE mode: policy receives the full-state view")
     agent = maybe_compile(raw_agent, args.compile)
     optimizer = torch.optim.Adam(raw_agent.parameters(), lr=args.lr, eps=1e-5)
     scaler = make_grad_scaler(device, use_cuda_amp and amp_dtype == torch.float16)
@@ -195,7 +207,8 @@ def main():
         # Hidden state at rollout start, replayed during the BPTT update.
         h0 = h.clone() if h is not None else None
         for step in range(num_steps):
-            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            pol_view = oracle_obs if args.oracle else obs
+            obs_t = torch.as_tensor(pol_view, dtype=torch.float32, device=device)
             oracle_t = torch.as_tensor(oracle_obs, dtype=torch.float32, device=device)
             feats_t = torch.as_tensor(feats, dtype=torch.float32, device=device)
             mask_t = torch.as_tensor(mask, device=device)

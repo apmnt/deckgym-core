@@ -390,6 +390,27 @@ def make_agent(
     heads: int = 4,
     memory: bool = False,
     belief: bool = False,
+    oracle: bool = False,
+) -> nn.Module:
+    agent = _build_agent(
+        obs_dim, act_feat_dim, arch, hidden, blocks, heads, memory, belief
+    )
+    # Oracle agents feed the full-state view to the *policy* (an all-knowing
+    # player, like the engine bots). The flag lives in the config so eval and
+    # self-play route the right observation automatically.
+    agent.config["oracle"] = oracle
+    return agent
+
+
+def _build_agent(
+    obs_dim: int,
+    act_feat_dim: int,
+    arch: str,
+    hidden: int | None,
+    blocks: int | None,
+    heads: int,
+    memory: bool,
+    belief: bool,
 ) -> nn.Module:
     if arch == "res":
         return ResAttnAgent(
@@ -439,8 +460,9 @@ def agent_from_state_dict(
     """
     if config is not None:
         cls = _ARCH_CLASSES[config["arch"]]
-        kwargs = {k: v for k, v in config.items() if k != "arch"}
+        kwargs = {k: v for k, v in config.items() if k not in ("arch", "oracle")}
         agent = cls(obs_dim, act_feat_dim, **kwargs)
+        agent.config["oracle"] = config.get("oracle", False)
         agent.load_state_dict(state_dict)
         return agent
     memory = "gru.weight_ih" in state_dict
