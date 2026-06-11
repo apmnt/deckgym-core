@@ -57,8 +57,9 @@ def _normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
 
 def _load_checkpoint(checkpoint, map_location) -> tuple[dict[str, torch.Tensor], dict | None]:
     """Returns (state_dict, config). Handles both the modern wrapped format
-    ({"state_dict": ..., "config": ...}) and legacy raw state dicts."""
-    obj = torch.load(checkpoint, map_location=map_location)
+    ({"state_dict": ..., "config": ...}) and legacy raw state dicts.
+    weights_only restricts unpickling to tensors/containers (no code exec)."""
+    obj = torch.load(checkpoint, map_location=map_location, weights_only=True)
     if isinstance(obj, dict) and "state_dict" in obj:
         return _normalize_state_dict(obj["state_dict"]), obj.get("config")
     return _normalize_state_dict(obj), None

@@ -17,6 +17,7 @@ Example:
 """
 
 import argparse
+import json
 import time
 from collections import deque
 from pathlib import Path
@@ -49,6 +50,15 @@ def parse_args():
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
+    p.add_argument(
+        "--target-kl",
+        type=float,
+        default=None,
+        help="stop the update early when approx KL exceeds this",
+    )
+    p.add_argument(
+        "--clip-vloss", action="store_true", help="PPO value clipping around old predictions"
+    )
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument(
         "--ent-coef-final",
@@ -114,6 +124,7 @@ def main():
     run_name = args.run_name or f"selfplay_{int(time.time())}"
     run_dir = Path("runs") / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
 
     env = SelfPlayVecEnv(
         args.deck,
@@ -243,8 +254,11 @@ def main():
         b_logprobs = logprobs_buf.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
+        b_values = values_buf.reshape(-1)
 
         clipfracs = []
+        kls = []
+        kl_stop = False
         envs_per_mb = max(1, num_envs // args.num_minibatches)
         if args.ent_coef_final is not None:
             progress = min(1.0, global_step / args.total_steps)
@@ -279,6 +293,7 @@ def main():
                         mb_logprobs = logprobs_buf[:, mb].reshape(-1)
                         mb_adv = advantages[:, mb].reshape(-1)
                         mb_returns = returns[:, mb].reshape(-1)
+                        mb_values = values_buf[:, mb].reshape(-1)
                     else:
                         logits, value = agent(
                             b_obs[mb],
@@ -290,6 +305,7 @@ def main():
                         mb_logprobs = b_logprobs[mb]
                         mb_adv = b_advantages[mb]
                         mb_returns = b_returns[mb]
+                        mb_values = b_values[mb]
                     logits = logits.float()
                     value = value.float()
                     dist = torch.distributions.Categorical(logits=logits)
@@ -297,12 +313,22 @@ def main():
                     entropy = dist.entropy()
                     logratio = new_logprob - mb_logprobs
                     ratio = logratio.exp()
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1.0) - logratio).mean()
                     mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                     pg_loss = torch.max(
                         -mb_adv * ratio,
                         -mb_adv * ratio.clamp(1 - args.clip_coef, 1 + args.clip_coef),
                     ).mean()
-                    v_loss = 0.5 * (value - mb_returns).pow(2).mean()
+                    if args.clip_vloss:
+                        v_clipped = mb_values + (value - mb_values).clamp(
+                            -args.clip_coef, args.clip_coef
+                        )
+                        v_loss = 0.5 * torch.max(
+                            (value - mb_returns).pow(2), (v_clipped - mb_returns).pow(2)
+                        ).mean()
+                    else:
+                        v_loss = 0.5 * (value - mb_returns).pow(2).mean()
                     loss = pg_loss - ent_coef * entropy.mean() + args.vf_coef * v_loss
                     if args.aux_belief > 0:
                         if args.memory:
@@ -317,6 +343,7 @@ def main():
                     clipfracs.append(
                         ((ratio - 1.0).abs() > args.clip_coef).float().mean().detach()
                     )
+                    kls.append(approx_kl.detach())
 
                 optimizer.zero_grad(set_to_none=True)
                 if scaler.is_enabled():
@@ -329,6 +356,11 @@ def main():
                     loss.backward()
                     nn.utils.clip_grad_norm_(raw_agent.parameters(), args.max_grad_norm)
                     optimizer.step()
+                if args.target_kl is not None and approx_kl.item() > args.target_kl:
+                    kl_stop = True
+                    break
+            if kl_stop:
+                break
 
         update += 1
         env.set_latest(raw_agent)
@@ -342,12 +374,39 @@ def main():
             win_rate = float("nan")
         sps = int(global_step / (time.time() - start))
         mean_clipfrac = torch.stack(clipfracs).mean().item() if clipfracs else float("nan")
+        mean_kl = torch.stack(kls).mean().item() if kls else float("nan")
+        with torch.no_grad():
+            var_returns = returns.var()
+            explained_var = (
+                float("nan")
+                if var_returns.item() == 0
+                else (1.0 - (returns - values_buf).var() / var_returns).item()
+            )
         print(
             f"step={global_step} selfplay_win={win_rate:.3f} (n={len(recent_outcomes)}) "
             f"pool={env.pool_size} v_loss={v_loss.item():.3f} pg_loss={pg_loss.item():.3f} "
-            f"clipfrac={mean_clipfrac:.3f} sps={sps}",
+            f"clipfrac={mean_clipfrac:.3f} kl={mean_kl:.4f} ev={explained_var:.2f} sps={sps}",
             flush=True,
         )
+        with open(run_dir / "metrics.jsonl", "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "global_step": global_step,
+                        "selfplay_win": win_rate,
+                        "pool": env.pool_size,
+                        "arms": {k: [wr, n] for k, (wr, n) in env.opponent_stats().items()},
+                        "v_loss": v_loss.item(),
+                        "pg_loss": pg_loss.item(),
+                        "clipfrac": mean_clipfrac,
+                        "approx_kl": mean_kl,
+                        "explained_variance": explained_var,
+                        "ent_coef": ent_coef,
+                        "sps": sps,
+                    }
+                )
+                + "\n"
+            )
         if update % 10 == 0:
             stats = env.opponent_stats()
             if stats:
