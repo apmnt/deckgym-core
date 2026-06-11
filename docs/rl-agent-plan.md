@@ -118,7 +118,37 @@ Implemented on top of it:
   count vectors) would need the Rust env to emit token observations — the
   natural next step if multi-deck training begins.
 
+## Beating expectiminimax-3 (phase 7 experiment grid)
+
+Goal: >50% vs `e3` (depth-3 search, sees the agent's hand). All e3 numbers
+are greedy evals pooled over fixed seeds; ±3.5–5pp at the listed sample
+sizes. Baseline going in: `selfplay_3m` at ~33.5% vs e3.
+
+| Combination | vs e2 | vs e3 | Verdict |
+|---|---|---|---|
+| A: PFSP p=2 + bots e1,e2,e3 (from selfplay_3m) | 55% | ~42% @700k, drifted to ~38% @1.2M | PFSP+bots works vs e2; e3 drifts without sharper focus |
+| A2: PFSP p=4, latest-prob 0.3 (from A@700k) | 61.5% | ~40.5% (400 eps) | best e2; e3 plateau ~40% — small net capacity-bound |
+| BC imitator of e3 (2500 games, 12 min, no RL) | 51.7% | **~45.3%** (400 eps) | best cost/benefit step in the project |
+| **C: BC → PFSP p=4 + bots, entropy annealed, 800k** | **60.3%** | **54.2% (801 eps, all 4 seeds >50%)** | **goal met** — `rl/checkpoints/bc_pfsp_champion.pt` |
+
+Champion gauntlet (res 256×2, ~1.9M params): 99% vs r, 96.5% vs v,
+87.5% vs e1, 60.3% vs e2, 54.2% vs e3 — all while playing blind against
+search opponents that see its hand.
+
 Lessons so far:
+
+- **Behavior cloning from the target bot is the highest-leverage step**:
+  distilling 2500 e3-vs-e3 games (12 minutes, `rl/bc_pretrain.py`) beat
+  every pure-RL combination tried before it, and PFSP fine-tuning from
+  that start added another ~+9pp vs e3. Imitating an oracle demonstrator
+  from hidden-information inputs is PTIE distillation and it works.
+- PFSP with engine bots in the roster reliably converts training into
+  wins against the *targeted* bot (e2: 49% → 61.5%), but without a strong
+  enough starting policy it plateaus below parity on e3 — and plain
+  (non-prioritized) training *drifts away* from the hardest opponent.
+- Evaluation variance vs e3 is large: 200-episode single-seed evals
+  ranged 36–53% for the *same* checkpoint. Claim wins only on multi-seed
+  pooled evals (we used 4×200).
 
 - The stage-3 fine-tune *directly against e2* did not improve on the stage-2
   checkpoint (paired-seed evals put it ~4pp worse) — sparse ±1 rewards
