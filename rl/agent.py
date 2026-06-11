@@ -54,6 +54,11 @@ def mlp(in_dim: int, hidden: list[int]) -> nn.Sequential:
 class ActionScorerAgent(nn.Module):
     def __init__(self, obs_dim: int, act_feat_dim: int, hidden: int = 256, act_hidden: int = 64):
         super().__init__()
+        self.config = {
+            "arch": "mlp",
+            "hidden": hidden,
+            "act_hidden": act_hidden,
+        }
         self.obs_encoder = mlp(obs_dim, [hidden, hidden])
         self.act_encoder = mlp(act_feat_dim, [act_hidden])
         self.scorer = nn.Sequential(
@@ -197,6 +202,20 @@ class _AttnScorerBase(nn.Module):
     def value(self, oracle_obs: torch.Tensor) -> torch.Tensor:
         return self.value_head(self.critic_encoder(oracle_obs)).squeeze(-1)
 
+    def aux_belief_loss(self, obs: torch.Tensor, oracle_obs: torch.Tensor) -> torch.Tensor:
+        """Auxiliary hidden-state inference: predict the opponent's hand
+        composition (a section of the oracle observation) from the policy
+        trunk. The gradient shapes the trunk toward belief-tracking features
+        even though the prediction itself is never used at play time."""
+        assert self.belief_head is not None, "agent was built without a belief head"
+        pred = self.belief_head(self.obs_encoder(obs))
+        vocab = pred.shape[-1]
+        # Oracle layout: 58 globals, 8 slots of (23+V), then card-count
+        # sections [my hand, their hand, ...] of V each (see rl_env.rs).
+        offset = 58 + 8 * (23 + vocab) + vocab
+        target = oracle_obs[..., offset : offset + vocab]
+        return nn.functional.mse_loss(pred, target)
+
     def forward(
         self,
         obs: torch.Tensor,
@@ -241,8 +260,20 @@ class ResAttnAgent(_AttnScorerBase):
         blocks: int = 4,
         heads: int = 4,
         memory: bool = False,
+        belief: bool = False,
     ):
         super().__init__()
+        self.config = {
+            "arch": "res",
+            "hidden": hidden,
+            "act_hidden": act_hidden,
+            "blocks": blocks,
+            "heads": heads,
+            "memory": memory,
+            "belief": belief,
+        }
+        vocab = (obs_dim - 242) // 14
+        self.belief_head = nn.Linear(hidden, vocab) if belief else None
         self.obs_encoder = res_encoder(obs_dim, hidden, blocks)
         self.act_encoder = res_encoder(act_feat_dim, act_hidden, 1)
         self.state_proj = nn.Linear(hidden, act_hidden)
@@ -320,8 +351,20 @@ class TokenTransformerAgent(_AttnScorerBase):
         blocks: int = 3,
         heads: int = 4,
         memory: bool = False,
+        belief: bool = False,
     ):
         super().__init__()
+        self.config = {
+            "arch": "tx",
+            "hidden": hidden,
+            "act_hidden": act_hidden,
+            "blocks": blocks,
+            "heads": heads,
+            "memory": memory,
+            "belief": belief,
+        }
+        vocab = (obs_dim - 242) // 14
+        self.belief_head = nn.Linear(hidden, vocab) if belief else None
         self.obs_encoder = TokenEncoder(obs_dim, hidden, blocks, heads)
         self.act_encoder = res_encoder(act_feat_dim, act_hidden, 1)
         self.state_proj = nn.Linear(hidden, act_hidden)
@@ -346,6 +389,7 @@ def make_agent(
     blocks: int | None = None,
     heads: int = 4,
     memory: bool = False,
+    belief: bool = False,
 ) -> nn.Module:
     if arch == "res":
         return ResAttnAgent(
@@ -355,6 +399,7 @@ def make_agent(
             blocks=blocks if blocks is not None else 4,
             heads=heads,
             memory=memory,
+            belief=belief,
         )
     if arch == "tx":
         return TokenTransformerAgent(
@@ -364,6 +409,7 @@ def make_agent(
             blocks=blocks if blocks is not None else 3,
             heads=heads,
             memory=memory,
+            belief=belief,
         )
     if arch == "mlp":
         if memory:
@@ -372,12 +418,34 @@ def make_agent(
     raise ValueError(f"unknown arch: {arch}")
 
 
+_ARCH_CLASSES = {
+    "mlp": ActionScorerAgent,
+    "res": ResAttnAgent,
+    "tx": TokenTransformerAgent,
+}
+
+
 def agent_from_state_dict(
-    state_dict: dict[str, torch.Tensor], obs_dim: int, act_feat_dim: int
+    state_dict: dict[str, torch.Tensor],
+    obs_dim: int,
+    act_feat_dim: int,
+    config: dict | None = None,
 ) -> nn.Module:
-    """Build the architecture a state dict was trained with (size included)."""
+    """Build the architecture a state dict was trained with (size included).
+
+    Modern checkpoints carry an explicit `config`; for legacy raw state
+    dicts the architecture is inferred from tensor shapes, which cannot
+    recover the attention head count (assumed 4 — the historical default).
+    """
+    if config is not None:
+        cls = _ARCH_CLASSES[config["arch"]]
+        kwargs = {k: v for k, v in config.items() if k != "arch"}
+        agent = cls(obs_dim, act_feat_dim, **kwargs)
+        agent.load_state_dict(state_dict)
+        return agent
     memory = "gru.weight_ih" in state_dict
-    heads = 4  # not recoverable from shapes; fixed across our runs
+    belief = "belief_head.weight" in state_dict
+    heads = 4  # legacy checkpoints: not recoverable from shapes
     if "obs_encoder.global_proj.weight" in state_dict:
         layer_ids = {
             int(key.split(".")[3])
@@ -392,6 +460,7 @@ def agent_from_state_dict(
             blocks=len(layer_ids),
             heads=heads,
             memory=memory,
+            belief=belief,
         )
     elif any(key.startswith("attn.") for key in state_dict):
         block_ids = {
@@ -407,6 +476,7 @@ def agent_from_state_dict(
             blocks=len(block_ids),
             heads=heads,
             memory=memory,
+            belief=belief,
         )
     else:
         agent = ActionScorerAgent(

@@ -55,19 +55,34 @@ def _normalize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torc
     }
 
 
+def _load_checkpoint(checkpoint, map_location) -> tuple[dict[str, torch.Tensor], dict | None]:
+    """Returns (state_dict, config). Handles both the modern wrapped format
+    ({"state_dict": ..., "config": ...}) and legacy raw state dicts."""
+    obj = torch.load(checkpoint, map_location=map_location)
+    if isinstance(obj, dict) and "state_dict" in obj:
+        return _normalize_state_dict(obj["state_dict"]), obj.get("config")
+    return _normalize_state_dict(obj), None
+
+
 def load_agent_state(agent: nn.Module, checkpoint, map_location) -> None:
-    state_dict = torch.load(checkpoint, map_location=map_location)
-    agent.load_state_dict(_normalize_state_dict(state_dict))
+    state_dict, _ = _load_checkpoint(checkpoint, map_location)
+    agent.load_state_dict(state_dict)
 
 
 def agent_from_checkpoint(checkpoint, obs_dim: int, act_feat_dim: int, map_location) -> nn.Module:
     """Build whichever architecture/size the checkpoint was trained with."""
     from agent import agent_from_state_dict
 
-    state_dict = _normalize_state_dict(torch.load(checkpoint, map_location=map_location))
-    return agent_from_state_dict(state_dict, obs_dim, act_feat_dim)
+    state_dict, config = _load_checkpoint(checkpoint, map_location)
+    return agent_from_state_dict(state_dict, obs_dim, act_feat_dim, config)
 
 
 def save_agent_state(agent: nn.Module, checkpoint) -> None:
     state_dict = _normalize_state_dict(agent.state_dict())
-    torch.save({key: value.detach().cpu() for key, value in state_dict.items()}, checkpoint)
+    torch.save(
+        {
+            "state_dict": {key: value.detach().cpu() for key, value in state_dict.items()},
+            "config": getattr(agent, "config", None),
+        },
+        checkpoint,
+    )

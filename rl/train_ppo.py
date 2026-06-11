@@ -42,6 +42,12 @@ def parse_args():
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument(
+        "--ent-coef-final",
+        type=float,
+        default=None,
+        help="linearly anneal entropy coef to this value over the run",
+    )
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--update-epochs", type=int, default=4)
@@ -57,6 +63,12 @@ def parse_args():
     p.add_argument("--heads", type=int, default=4, help="attention heads")
     p.add_argument(
         "--memory", action="store_true", help="GRU over decision steps (res/tx arch)"
+    )
+    p.add_argument(
+        "--aux-belief",
+        type=float,
+        default=0.0,
+        help="weight of the opponent-hand prediction auxiliary loss (res/tx arch)",
     )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
@@ -96,6 +108,9 @@ def main():
             args.resume, env.obs_dim, env.act_feat_dim, map_location=device
         ).to(device)
         args.memory = getattr(raw_agent, "gru", None) is not None
+        if args.aux_belief > 0 and getattr(raw_agent, "belief_head", None) is None:
+            print("checkpoint has no belief head; disabling --aux-belief")
+            args.aux_belief = 0.0
         print(f"resumed weights from {args.resume} ({type(raw_agent).__name__})")
     else:
         raw_agent = make_agent(
@@ -106,6 +121,7 @@ def main():
             args.blocks,
             args.heads,
             memory=args.memory,
+            belief=args.aux_belief > 0,
         ).to(device)
     agent = maybe_compile(raw_agent, args.compile)
     optimizer = torch.optim.Adam(raw_agent.parameters(), lr=args.lr, eps=1e-5)
@@ -230,6 +246,11 @@ def main():
         section_start = begin_profile() if args.profile else None
         clipfracs = []
         envs_per_mb = max(1, num_envs // args.num_minibatches)
+        if args.ent_coef_final is not None:
+            progress = min(1.0, global_step / args.total_steps)
+            ent_coef = args.ent_coef + (args.ent_coef_final - args.ent_coef) * progress
+        else:
+            ent_coef = args.ent_coef
         for _ in range(args.update_epochs):
             if args.memory:
                 # Sequence (env-major) minibatches: the GRU must be replayed
@@ -282,7 +303,16 @@ def main():
                         -mb_adv * ratio.clamp(1 - args.clip_coef, 1 + args.clip_coef),
                     ).mean()
                     v_loss = 0.5 * (value - mb_returns).pow(2).mean()
-                    loss = pg_loss - args.ent_coef * entropy.mean() + args.vf_coef * v_loss
+                    loss = pg_loss - ent_coef * entropy.mean() + args.vf_coef * v_loss
+                    if args.aux_belief > 0:
+                        if args.memory:
+                            belief_obs = obs_buf[:, mb].reshape(-1, env.obs_dim)
+                            belief_oracle = oracle_buf[:, mb].reshape(-1, env.obs_dim)
+                        else:
+                            belief_obs, belief_oracle = b_obs[mb], b_oracle[mb]
+                        loss = loss + args.aux_belief * raw_agent.aux_belief_loss(
+                            belief_obs, belief_oracle
+                        )
                 with torch.no_grad():
                     clipfracs.append(
                         ((ratio - 1.0).abs() > args.clip_coef).float().mean().detach()
@@ -319,7 +349,9 @@ def main():
         )
 
         section_start = begin_profile() if args.profile else None
-        save_agent_state(raw_agent, run_dir / "latest.pt")
+        # Throttled: synchronous serialization in the hot loop is wasted I/O.
+        if (global_step // (num_steps * num_envs)) % 5 == 0:
+            save_agent_state(raw_agent, run_dir / "latest.pt")
         if section_start is not None:
             add_profile(profile_times, "checkpoint", section_start)
         if args.profile and update_start is not None:
