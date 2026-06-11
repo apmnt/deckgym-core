@@ -14,6 +14,7 @@ Example:
 """
 
 import argparse
+import pickle
 import time
 from pathlib import Path
 
@@ -33,10 +34,16 @@ def parse_args():
     p.add_argument("--bot", default="e3", help="demonstrator player code for both seats")
     p.add_argument("--episodes", type=int, default=2000)
     p.add_argument("--num-envs", type=int, default=32)
+    p.add_argument(
+        "--dataset",
+        default=None,
+        help="cache path for the collected games; reused if it exists (for ablations)",
+    )
     p.add_argument("--arch", choices=["res", "tx", "mlp"], default="res")
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)
+    p.add_argument("--memory", action="store_true", help="GRU agent (trained stateless in BC)")
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -103,7 +110,17 @@ def main():
     np.random.seed(args.seed)
     device = resolve_device(args.device)
 
-    samples, obs_dim, feat_dim = collect(args)
+    if args.dataset and Path(args.dataset).exists():
+        with open(args.dataset, "rb") as f:
+            samples, obs_dim, feat_dim = pickle.load(f)
+        print(f"loaded {len(samples)} samples from {args.dataset}")
+    else:
+        samples, obs_dim, feat_dim = collect(args)
+        if args.dataset:
+            Path(args.dataset).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.dataset, "wb") as f:
+                pickle.dump((samples, obs_dim, feat_dim), f)
+            print(f"cached dataset to {args.dataset}")
     outcomes = np.array([s[4] for s in samples], dtype=np.float32)
     print(
         f"dataset: {len(samples)} decisions, "
@@ -117,6 +134,7 @@ def main():
         args.hidden,
         args.blocks,
         args.heads,
+        memory=args.memory,
         belief=args.aux_belief > 0,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
@@ -140,7 +158,14 @@ def main():
             actions_b = torch.tensor([rec[3] for rec in batch], device=device)
             outcome_b = torch.tensor([float(rec[4]) for rec in batch], device=device)
 
-            logits, value = agent(obs_b, oracle_b, feats_b, mask_b)
+            if args.memory:
+                # i.i.d. samples: the GRU runs one step from zero hidden, so
+                # it learns a state-independent transform; RL fine-tuning
+                # later exploits the recurrence.
+                logits, _ = agent.policy_logits(obs_b, feats_b, mask_b)
+                value = agent.value(oracle_b)
+            else:
+                logits, value = agent(obs_b, oracle_b, feats_b, mask_b)
             policy_loss = F.cross_entropy(logits, actions_b)
             value_loss = F.mse_loss(value, outcome_b)
             loss = policy_loss + args.vf_coef * value_loss
