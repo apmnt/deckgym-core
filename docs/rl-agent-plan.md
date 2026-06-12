@@ -135,6 +135,31 @@ Champion gauntlet (res 256×2, ~1.9M params): 99% vs r, 96.5% vs v,
 87.5% vs e1, 60.3% vs e2, 54.2% vs e3 — all while playing blind against
 search opponents that see its hand.
 
+## Ablation slate (phase 9)
+
+Two grids, both on the venusaur-exeggutor mirror. BC grid: 5-epoch
+distillation cells on one shared 70k-decision e3 dataset, evaluated vs e3
+(400 episodes pooled, ±5pp). RL grid: 200k-step PFSP fine-tunes from the
+same BC checkpoint, one variable per cell (reference cell 46.0%).
+
+| Family | Cells (vs e3) | Verdict |
+|---|---|---|
+| Architecture (BC) | **res 45.3%**, tx 37.8%, mlp 26.5% | dominant factor; action-attention residual net is worth ~18pp |
+| Width (BC) | 384: 44.8%, **512: 47.5%** | mildly positive |
+| Heads (BC) | 8: 47.0% | mildly positive |
+| Belief loss (BC) | 0.05/0.1/0.25: 44.0–46.0% | neutral |
+| Memory | BC stateless: 37.8% → RL fine-tune: 45.8% | recovers but no gain; ~40% slower |
+| Shaping (RL) | 0.1: 46.0%, 0.2: 44.5% | neutral |
+| Entropy schedule (RL) | fixed: 45.3%, hi-anneal: 45.5% | neutral |
+| Curriculum (RL) | PFSP p4: 46.0%, uniform bots: 49.5%, **latest-only: 43.0%** | bots in the roster are the active ingredient; PFSP vs uniform within noise at this scale |
+| Pool config (RL) | pool 8/snap 5: 49.5% | within noise |
+
+Conclusion: in this regime nearly all the variance lives in
+**architecture, the BC warm start, and bot-anchored opponent rosters** —
+the PPO dials (shaping, entropy, pool sizing, PFSP exponent) are flat
+within ±3pp. The PFSP-vs-uniform comparison may differ at full 800k-step
+scale, where Combo A showed drift away from e3 without prioritization.
+
 ## Oracle (all-knowing) agent experiment (phase 8)
 
 An information-matched counterpart to the engine bots: `--oracle` feeds the
