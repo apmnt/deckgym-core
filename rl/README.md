@@ -8,6 +8,12 @@ returns the observation plus a feature vector for every *legal* action, and
 the policy scores the legal-action list directly (one logit per action, the
 ygo-agent / DouZero pattern) — no global flat action space is needed.
 
+**Current best (honest agent, venusaur-exeggutor mirror)**: 99% vs random,
+96.5% vs value-function, 87.5% vs expectiminimax-1, 60.3% vs e2, **54.2% vs
+e3** (801 episodes, 4 seeds) — playing blind against search bots that see
+its hand. Checkpoint: `rl/checkpoints/bc_pfsp_champion.pt`. Full experiment
+history and lessons: `docs/rl-agent-plan.md`.
+
 ## Setup
 
 ```bash
@@ -24,14 +30,54 @@ uv run python -c "import torch; print(torch.cuda.is_available()); print(torch.cu
 
 ## Train
 
-```bash
-# Phase 1: beat the random player
-uv run python rl/train_ppo.py --opponent r --total-steps 2000000 --amp --compile
+The proven recipe (what produced the champion) is **behavior-cloning warm
+start, then PFSP self-play with engine bots in the roster**:
 
-# Phase 2/3: harder built-in opponents
-uv run python rl/train_ppo.py --opponent v  --resume runs/<run>/latest.pt --amp --compile
-uv run python rl/train_ppo.py --opponent e2 --resume runs/<run>/latest.pt --amp --compile
+```bash
+# 1. Distill expectiminimax-3 from bot-vs-bot games (~15 min on CPU).
+#    --dataset caches the collected games for reuse across runs/ablations.
+uv run python rl/bc_pretrain.py --bot e3 --episodes 2500 \
+  --dataset runs/bc_e3_dataset.pkl --out runs/bc_e3/bc.pt
+
+# 2. PFSP self-play fine-tune with e1/e2/e3 anchoring the roster.
+uv run python rl/train_selfplay.py --resume runs/bc_e3/bc.pt \
+  --total-steps 800000 --bots e1,e2,e3 --latest-prob 0.3 --pfsp-power 4 \
+  --ent-coef-final 0.003 --amp --compile
 ```
+
+In self-play the learner (seat 0) faces seat-1 opponents sampled per
+episode: a frozen copy of its latest weights with `--latest-prob`, otherwise
+a historical snapshot or engine bot chosen PFSP-style (probability ∝
+`(1 - learner winrate)^pfsp_power`), focusing training on whatever still
+beats it. The logged self-play win rate hovers near 50% by construction —
+measure progress with `rl/eval.py` against fixed opponents. Per-arm
+winrates are printed every 10 updates and logged to `metrics.jsonl`.
+
+The plain curriculum (`train_ppo.py` vs `r`, then `v`, then self-play
+without bots) also works but plateaus lower; ablations showed the BC warm
+start and the bot-anchored PFSP roster are the two ingredients that matter,
+while reward shaping and entropy schedules are neutral in this regime.
+
+Every run writes `runs/<name>/config.json`, per-update `metrics.jsonl`
+(losses, clipfrac, approx KL, explained variance, SPS, self-play arms), and
+checkpoints (`latest.pt` every 5th update, `final.pt` at the end).
+Diagnostics flags: `--target-kl` (early-stop updates), `--clip-vloss`.
+
+Opponent codes are the engine's player codes: `r` random, `w` weighted-random,
+`aa` attach-attack, `et` end-turn, `v` value-function, `e<N>` expectiminimax
+of depth N, `m` MCTS. Depth study: e<N> stops improving at ~depth 4
+(e3→e4 ≈ +6pp, e4→e5 ≈ nothing).
+
+### Oracle (all-knowing) agents
+
+`--oracle` (in `bc_pretrain.py`, `train_ppo.py`, `train_selfplay.py`) trains
+a policy that sees the **full state** — opponent hand and deck included —
+like the engine bots do. The flag is stored in the checkpoint config, so
+`eval.py` and the self-play wrapper automatically route the right view:
+oracle and honest agents share every script and can be benchmarked against
+the same opponents (or each other via the self-play pool). Keep oracle
+checkpoints clearly named; they are not legal players, they are strength
+ceilings and sparring partners.
 
 The training scripts use `--device auto` by default: CUDA is selected when
 PyTorch can see a CUDA device, otherwise CPU is used. Use `--device cuda` if
@@ -65,25 +111,24 @@ uv run python rl/train_ppo.py --opponent r --total-steps 2000000 \
   --amp --compile --device cuda
 ```
 
-Opponent codes are the engine's player codes: `r` random, `w` weighted-random,
-`aa` attach-attack, `et` end-turn, `v` value-function, `e<N>` expectiminimax
-of depth N, `m` MCTS.
-
-```bash
-# Phase 4: self-play with a historical opponent pool (fictitious self-play)
-uv run python rl/train_selfplay.py --resume rl/checkpoints/hidden_info_stage2.pt --amp --compile
-```
-
-In self-play the learner (seat 0) faces frozen policies in seat 1: a copy of
-its latest weights with `--latest-prob`, otherwise a uniform sample from a
-pool snapshotted every `--snapshot-every` updates. The logged win rate hovers
-near 50% by construction — measure progress with `rl/eval.py` against fixed
-opponents.
-
 ## Evaluate
 
 ```bash
-uv run python rl/eval.py runs/<run>/latest.pt --opponent r --episodes 500 --amp
+# Panel of opponents, multiple seeds pooled, Wilson 95% CIs per opponent:
+uv run python rl/eval.py runs/<run>/latest.pt \
+  --opponent r,v,e1,e2,e3 --episodes 200 --seeds 999,4242 --amp
+```
+
+Evaluation variance against search bots is large (single 200-episode seeds
+ranged 36–53% for the *same* checkpoint vs e3) — claim improvements only on
+multi-seed pooled evals.
+
+## Tests and ablations
+
+```bash
+uv run python -m pytest rl/tests -q   # checkpoint round-trips, masking, smoke
+bash rl/run_bc_ablation.sh            # arch/width/heads/belief BC grid
+bash rl/run_rl_ablation.sh            # shaping/entropy/curriculum/pool RL grid
 ```
 
 ## Profiling
@@ -126,13 +171,20 @@ minibatches become env-major sequences and the GRU is replayed over the
 rollout with stored initial hidden states (BPTT); self-play opponents carry
 their own per-env hidden state.
 
-Checkpoints embed their architecture implicitly — `eval.py` and `--resume`
-auto-detect arch, sizes, and memory from the state dict, so old checkpoints
-keep working (`--arch`/`--hidden`/`--memory` are ignored when resuming).
+`--aux-belief <w>` (res/tx) adds an opponent-hand prediction head trained
+against the oracle view — auxiliary hidden-state inference shaping the
+policy trunk (neutral in mirror-match ablations; disabled automatically for
+oracle agents).
 
-When scaling further (per the upgrades guide): raise `--ent-coef` to
-0.02–0.03 early in training and grow the per-update batch via `--num-envs`
-before touching `--lr`.
+Checkpoints carry their architecture config explicitly (arch, sizes, heads,
+memory, belief, oracle) and load with `weights_only=True`; legacy raw state
+dicts are still detected from tensor shapes. `--arch`/`--hidden`/`--memory`
+are ignored when resuming — the checkpoint dictates the network.
+
+Ablation results (BC distillation of e3, 400 episodes/cell): architecture
+dominates — res ≈ 45% vs e3, tx ≈ 38%, mlp ≈ 27%; hidden 512 and 8 heads
+are mildly positive; belief weight is neutral. When scaling further: grow
+the per-update batch via `--num-envs` before touching `--lr`.
 
 ## Design notes
 
