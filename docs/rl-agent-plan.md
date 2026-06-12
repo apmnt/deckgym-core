@@ -135,6 +135,30 @@ Champion gauntlet (res 256×2, ~1.9M params): 99% vs r, 96.5% vs v,
 87.5% vs e1, 60.3% vs e2, 54.2% vs e3 — all while playing blind against
 search opponents that see its hand.
 
+## Oracle (all-knowing) agent experiment (phase 8)
+
+An information-matched counterpart to the engine bots: `--oracle` feeds the
+full-state view to the policy too (checkpoint:
+`rl/checkpoints/oracle_pfsp.pt`). Same recipe as the champion (BC from the
+cached e3 dataset, then 800k PFSP steps with e1/e2/e3 in the roster).
+
+| Agent | vs e2 | vs e3 (801 eps) |
+|---|---|---|
+| Honest champion (hidden info) | 60.3% | **54.2%** [50.8, 57.6] |
+| Oracle (sees everything) | 52.6% | 45.2% [41.8, 48.7] |
+
+Findings (one run each — interpret with care):
+
+- **Full information did not help.** The oracle BC imitator matched the
+  honest one (44.5% vs 45.3% — e3's moves are as predictable from the
+  legal view), and the oracle's RL fine-tune then plateaued (+1pp; its
+  450k and 800k checkpoints are statistically identical) while the honest
+  fine-tune climbed +9pp. The hidden-information bottleneck appears to act
+  as a regularizer: the honest policy trains on a smaller input manifold
+  with the same capacity and budget.
+- The oracle run survived a host kill + resume (optimizer/pool reset at
+  450k); ruled out as the cause by evaluating the pre-restart checkpoint.
+
 Lessons so far:
 
 - **Behavior cloning from the target bot is the highest-leverage step**:
