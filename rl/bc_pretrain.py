@@ -29,8 +29,13 @@ from torch_runtime import resolve_device, save_agent_state
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--deck", default="example_decks/venusaur-exeggutor.txt")
-    p.add_argument("--opponent-deck", default=None)
+    p.add_argument(
+        "--deck",
+        default="example_decks/venusaur-exeggutor.txt",
+        help="seat-0 deck: file, folder of decks, or comma-separated list "
+        "(a pool is sampled per episode — use folders for deck-general training)",
+    )
+    p.add_argument("--opponent-deck", default=None, help="seat-1 deck spec (defaults to --deck)")
     p.add_argument("--bot", default="e3", help="demonstrator player code for both seats")
     p.add_argument("--episodes", type=int, default=2000)
     p.add_argument("--num-envs", type=int, default=32)
@@ -39,7 +44,7 @@ def parse_args():
         default=None,
         help="cache path for the collected games; reused if it exists (for ablations)",
     )
-    p.add_argument("--arch", choices=["res", "tx", "mlp"], default="res")
+    p.add_argument("--arch", choices=["res", "tx", "mlp", "gen"], default="res")
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)

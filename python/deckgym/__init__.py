@@ -11,6 +11,9 @@ from .deckgym import (
     PySimulationResults as SimulationResults,
     PyRlVecEnv,
     py_simulate as simulate,
+    py_card_attr_table as card_attr_table,
+    py_num_global_cards as num_global_cards,
+    py_global_card_ids as global_card_ids,
     get_player_types,
 )
 
@@ -27,5 +30,8 @@ __all__ = [
     "SimulationResults",
     "PyRlVecEnv",
     "simulate",
+    "card_attr_table",
+    "num_global_cards",
+    "global_card_ids",
     "get_player_types",
 ]

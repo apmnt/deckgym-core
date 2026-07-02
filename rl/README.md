@@ -14,6 +14,54 @@ e3** (801 episodes, 4 seeds) — playing blind against search bots that see
 its hand. Checkpoint: `rl/checkpoints/bc_pfsp_champion.pt`. Full experiment
 history and lessons: `docs/rl-agent-plan.md`.
 
+## Deck-general agent (`--arch gen`)
+
+The mirror-match agents above are matchup specialists: their observation
+one-hots cards over the *match's* vocabulary, so the input meaning changes
+with the decks. `--arch gen` is the deck-general agent — **one network that
+plays any deck against any deck**:
+
+- The env pads every card-vocabulary section to a fixed 40 slots and appends
+  each slot's *global* card id to the observation, so observation/action
+  dims are identical for every matchup (`src/rl_env.rs::VOCAB_SIZE`).
+- `GeneralAgent` (rl/agent.py) looks those ids up in a `CardEncoder`: a
+  learned identity embedding over the engine's full card index **plus a
+  projection of the card's static attributes** (HP, type, stage, attack
+  damage/costs, trainer kind — `deckgym.card_attr_table()`). Every local
+  one-hot/count section is projected into embedding space
+  (`counts @ card_repr`) before the usual residual trunk + action-attention
+  scorer. Identity embeddings capture what training saw; attribute features
+  carry semantics to rarely-seen and *unseen* cards. This is the card-token
+  pattern of ygo-agent (Yu-Gi-Oh) and Cardsformer (Hearthstone).
+- Deck specs everywhere (`--deck`, `--opponent-deck`) now accept a file, a
+  folder, a comma-separated list, or a `.pool` list file; each episode
+  samples one deck per seat, so training mixes all pairings.
+  `rl/pools/train.pool` (25 decks) and `rl/pools/heldout.pool` (4 decks kept
+  out of training, for zero-shot eval) define the standard split.
+- Decklists are treated as public information (like the metagame): both
+  seats' vocabularies are visible, but the opponent's hand and remaining
+  deck contents stay hidden exactly as before. Engine search bots still see
+  strictly more than the agent.
+
+Train it with the same proven recipe, just on the deck pool:
+
+```bash
+# 1. BC warm start: distill e3-vs-e3 games sampled across all pool pairings.
+uv run python rl/bc_pretrain.py --arch gen --deck rl/pools/train.pool \
+  --bot e3 --episodes 6000 --dataset runs/bc_gen_dataset.pkl --out runs/bc_gen/bc.pt
+
+# 2. PFSP self-play fine-tune with engine bots anchoring the roster.
+uv run python rl/train_selfplay.py --resume runs/bc_gen/bc.pt \
+  --deck rl/pools/train.pool --total-steps 800000 \
+  --bots e1,e2,e3 --latest-prob 0.3 --pfsp-power 4 --ent-coef-final 0.003
+
+# 3. Evaluate on random pool matchups and on never-seen decks.
+uv run python rl/eval.py runs/<run>/latest.pt --deck rl/pools/train.pool \
+  --opponent r,e1,e2,e3 --episodes 200 --seeds 999,4242
+uv run python rl/eval.py runs/<run>/latest.pt --deck rl/pools/heldout.pool \
+  --opponent e3 --episodes 200 --seeds 999,4242
+```
+
 ## Setup
 
 ```bash

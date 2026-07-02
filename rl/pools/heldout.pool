@@ -1,0 +1,6 @@
+# Held-out decks: never seen during training. Evaluating on these matchups
+# measures zero-shot generalization of the deck-general agent to new decks.
+../../example_decks/donphan.txt
+../../example_decks/solgaleo_sylveon.txt
+../../example_decks/suicune-greninja.txt
+../../example_decks/venu-serperior.txt

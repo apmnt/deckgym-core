@@ -12,7 +12,9 @@ use crate::{
     game::Game,
     models::{Ability, Attack, Card, EnergyType, PlayedCard},
     players::{create_players, fill_code_array, parse_player_code, PlayerCode},
-    rl_env::{RlEnvCore, MAX_ACTIONS},
+    rl_env::{
+        card_attr_table, global_card_ids, num_global_cards, RlEnvCore, CARD_ATTR_DIM, MAX_ACTIONS,
+    },
     state::{GameOutcome, State},
 };
 
@@ -876,8 +878,69 @@ pub fn py_simulate(
 #[pyclass(unsendable)]
 pub struct PyRlVecEnv {
     envs: Vec<RlEnvCore>,
-    deck_a: Deck,
-    deck_b: Deck,
+}
+
+/// Parse a deck spec into a pool: a single deck file, a directory (all
+/// `*.txt` decks inside), a `.pool` file (newline-separated deck paths,
+/// `#` comments allowed, relative to the pool file's directory), or a
+/// comma-separated list of any of these.
+fn parse_deck_pool(spec: &str) -> PyResult<Vec<Deck>> {
+    let mut decks = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let path = std::path::Path::new(part);
+        if path.extension().is_some_and(|ext| ext == "pool") {
+            let base = path.parent().unwrap_or(std::path::Path::new("."));
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to read pool file {part}: {e}"
+                ))
+            })?;
+            for line in content.lines() {
+                let line = line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let deck_path = base.join(line);
+                decks.push(Deck::from_file(deck_path.to_str().unwrap()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to load deck {} (from {part}): {e}",
+                        deck_path.display()
+                    ))
+                })?);
+            }
+        } else if path.is_dir() {
+            let mut files: Vec<_> = std::fs::read_dir(path)
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to read deck folder {part}: {e}"
+                    ))
+                })?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
+                .collect();
+            files.sort();
+            for file in files {
+                decks.push(Deck::from_file(file.to_str().unwrap()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to load deck {}: {e}",
+                        file.display()
+                    ))
+                })?);
+            }
+        } else {
+            decks.push(Deck::from_file(part).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to load deck {part}: {e}"
+                ))
+            })?);
+        }
+    }
+    if decks.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "deck spec '{spec}' contains no decks"
+        )));
+    }
+    Ok(decks)
 }
 
 type StepArrays<'py> = (
@@ -888,7 +951,10 @@ type StepArrays<'py> = (
 );
 
 type EnvWriteItem<'a> = (
-    (((&'a mut RlEnvCore, &'a mut [f32]), &'a mut [f32]), &'a mut [f32]),
+    (
+        ((&'a mut RlEnvCore, &'a mut [f32]), &'a mut [f32]),
+        &'a mut [f32],
+    ),
     &'a mut u32,
 );
 
@@ -955,34 +1021,21 @@ impl PyRlVecEnv {
             }
             Some(code)
         };
-        let deck_a = Deck::from_file(deck_a_path).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load deck A: {}", e))
-        })?;
-        let deck_b = Deck::from_file(deck_b_path).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load deck B: {}", e))
-        })?;
+        let pool_a = parse_deck_pool(deck_a_path)?;
+        let pool_b = parse_deck_pool(deck_b_path)?;
 
         let envs = (0..num_envs)
             .map(|i| {
-                let opponent_player = code.clone().map(|code| {
-                    let players =
-                        create_players(deck_a.clone(), deck_b.clone(), vec![code.clone(), code]);
-                    players.into_iter().nth(1).unwrap()
-                });
-                RlEnvCore::new(
-                    deck_a.clone(),
-                    deck_b.clone(),
-                    opponent_player,
+                RlEnvCore::new_with_pools(
+                    pool_a.clone(),
+                    pool_b.clone(),
+                    code.clone(),
                     seed.wrapping_add(i as u64),
                     shaping_coef,
                 )
             })
             .collect();
-        Ok(PyRlVecEnv {
-            envs,
-            deck_a,
-            deck_b,
-        })
+        Ok(PyRlVecEnv { envs })
     }
 
     fn num_envs(&self) -> usize {
@@ -1176,21 +1229,12 @@ impl PyRlVecEnv {
             }
             slot_of[i] = k;
         }
-        let deck_a = &self.deck_a;
-        let deck_b = &self.deck_b;
         let picks: Vec<(usize, usize)> = self
             .envs
             .par_iter_mut()
             .enumerate()
             .filter(|(i, _)| slot_of[*i] != usize::MAX)
-            .map(|(i, env)| {
-                let mut bot =
-                    create_players(deck_a.clone(), deck_b.clone(), vec![code.clone(), code.clone()])
-                        .into_iter()
-                        .nth(1)
-                        .unwrap();
-                (slot_of[i], env.decide_with(bot.as_mut()))
-            })
+            .map(|(i, env)| (slot_of[i], env.decide_with_code(&code)))
             .collect();
         let mut out = vec![0usize; indices.len()];
         for (k, idx) in picks {
@@ -1206,6 +1250,27 @@ impl PyRlVecEnv {
             .map(|env| env.legal_action_strings())
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIndexError, _>("env_idx out of range"))
     }
+}
+
+/// Static per-card attribute table for embedding-based networks: a flat
+/// `(num_cards + 1) * attr_dim` f32 array in global card-index order (the
+/// last row is the all-zeros padding id), plus the attr dim. Observations
+/// reference these rows through the vocabulary-id section.
+#[pyfunction]
+pub fn py_card_attr_table(py: Python<'_>) -> (Bound<'_, PyArray1<f32>>, usize) {
+    (card_attr_table().into_pyarray_bound(py), CARD_ATTR_DIM)
+}
+
+/// Number of cards in the global index (the padding id equals this value).
+#[pyfunction]
+pub fn py_num_global_cards() -> usize {
+    num_global_cards()
+}
+
+/// Card id strings in global index order (debugging/tooling).
+#[pyfunction]
+pub fn py_global_card_ids() -> Vec<String> {
+    global_card_ids()
 }
 
 /// Get available player types
@@ -1238,5 +1303,8 @@ pub fn deckgym(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRlVecEnv>()?;
     m.add_function(wrap_pyfunction!(py_simulate, m)?)?;
     m.add_function(wrap_pyfunction!(get_player_types, m)?)?;
+    m.add_function(wrap_pyfunction!(py_card_attr_table, m)?)?;
+    m.add_function(wrap_pyfunction!(py_num_global_cards, m)?)?;
+    m.add_function(wrap_pyfunction!(py_global_card_ids, m)?)?;
     Ok(())
 }

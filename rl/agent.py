@@ -239,6 +239,209 @@ class _AttnScorerBase(nn.Module):
         return action, dist.log_prob(action), value, h_new
 
 
+class CardEncoder(nn.Module):
+    """Per-card representation shared by every observation/action section:
+    a learned identity embedding over the engine's *global* card index plus
+    a projection of the card's static attributes (HP, type, stage, attack
+    damage/costs, trainer kind, ...). Identity captures what training saw;
+    attributes give semantics that generalize to rarely-seen cards
+    (ygo-agent / Cardsformer pattern). Index `num_cards` is the padding id
+    (zero embedding, zero attribute row)."""
+
+    def __init__(self, num_cards: int, attr_dim: int, d_card: int, attr_table=None):
+        super().__init__()
+        self.emb = nn.Embedding(num_cards + 1, d_card, padding_idx=num_cards)
+        self.attr_proj = nn.Linear(attr_dim, d_card)
+        if attr_table is None:
+            attr_table = torch.zeros(num_cards + 1, attr_dim)
+        assert attr_table.shape == (num_cards + 1, attr_dim)
+        # Buffer: saved in checkpoints, so a checkpoint is self-contained.
+        self.register_buffer("attr_table", attr_table.float())
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """ids: [..., V] long → [..., V, d_card]."""
+        return self.emb(ids) + self.attr_proj(self.attr_table[ids])
+
+
+class GeneralAgent(_AttnScorerBase):
+    """Deck-general agent: plays any deck against any deck.
+
+    The env's observation carries, per match, a card vocabulary of up to
+    `vocab` slots: board one-hots and zone count vectors are expressed over
+    those local slots, and the final `vocab` obs entries hold each slot's
+    *global* card id. This agent looks the ids up in a `CardEncoder` and
+    replaces every local one-hot/count section with its embedding-space
+    projection (counts @ card_repr), so the trunk input has the same
+    meaning whatever decks are on the table. Action features are re-embedded
+    the same way. Downstream (residual trunk, self-attention over the
+    legal-action set, oracle critic, optional GRU memory) matches
+    `ResAttnAgent`.
+    """
+
+    GLOBALS = 58
+    NUM_SLOTS = 8
+    SLOT_NUM = 23  # occupied flag + numeric slot features
+    NUM_ZONES = 6
+    ACT_CLASSES = 18
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_feat_dim: int,
+        hidden: int = 384,
+        act_hidden: int = 128,
+        blocks: int = 3,
+        heads: int = 4,
+        memory: bool = False,
+        num_cards: int = 0,
+        attr_dim: int = 0,
+        d_card: int = 64,
+        vocab: int = 40,
+        attr_table=None,
+    ):
+        super().__init__()
+        assert num_cards > 0 and attr_dim > 0, "gen arch needs the global card table"
+        expected = (
+            self.GLOBALS
+            + self.NUM_SLOTS * (self.SLOT_NUM + vocab)
+            + (self.NUM_ZONES + 1) * vocab
+        )
+        assert obs_dim == expected, f"obs_dim {obs_dim} != expected {expected} (vocab={vocab})"
+        self.config = {
+            "arch": "gen",
+            "hidden": hidden,
+            "act_hidden": act_hidden,
+            "blocks": blocks,
+            "heads": heads,
+            "memory": memory,
+            "num_cards": num_cards,
+            "attr_dim": attr_dim,
+            "d_card": d_card,
+            "vocab": vocab,
+        }
+        self.vocab = vocab
+        self.d_card = d_card
+        self.cards = CardEncoder(num_cards, attr_dim, d_card, attr_table)
+        trunk_in = (
+            self.GLOBALS + self.NUM_SLOTS * (self.SLOT_NUM + d_card) + self.NUM_ZONES * d_card
+        )
+        act_in = act_feat_dim - vocab + d_card
+        self.belief_head = None
+        self.obs_encoder = res_encoder(trunk_in, hidden, blocks)
+        self.act_encoder = res_encoder(act_in, act_hidden, 1)
+        self.state_proj = nn.Linear(hidden, act_hidden)
+        self.attn_ln = nn.LayerNorm(act_hidden)
+        self.attn = nn.MultiheadAttention(act_hidden, heads, batch_first=True)
+        self.scorer = nn.Sequential(
+            nn.LayerNorm(act_hidden),
+            nn.Linear(act_hidden, act_hidden),
+            nn.GELU(),
+            nn.Linear(act_hidden, 1),
+        )
+        self.gru = nn.GRUCell(hidden, hidden) if memory else None
+        self.critic_encoder = res_encoder(trunk_in, hidden, blocks)
+        self.value_head = nn.Linear(hidden, 1)
+
+    def _card_repr(self, obs: torch.Tensor) -> torch.Tensor:
+        """[B, obs_dim] → [B, V, d_card] from the trailing vocab-id section."""
+        ids = obs[:, -self.vocab :].long()
+        return self.cards(ids)
+
+    def _flatten_obs(self, obs: torch.Tensor, card_repr: torch.Tensor) -> torch.Tensor:
+        """Project the local one-hot/count sections into embedding space."""
+        batch = obs.shape[0]
+        v = self.vocab
+        globals_sec = obs[:, : self.GLOBALS]
+        slots = obs[:, self.GLOBALS : self.GLOBALS + self.NUM_SLOTS * (self.SLOT_NUM + v)]
+        # Slot layout (see rl_env.rs): [occupied(1) | card one-hot(v) | numeric(22)]
+        slots = slots.reshape(batch, self.NUM_SLOTS, self.SLOT_NUM + v)
+        slot_cards = torch.bmm(slots[:, :, 1 : 1 + v], card_repr)
+        slot_rest = torch.cat([slots[:, :, :1], slots[:, :, 1 + v :]], dim=-1)
+        zones_start = self.GLOBALS + self.NUM_SLOTS * (self.SLOT_NUM + v)
+        zones = obs[:, zones_start : zones_start + self.NUM_ZONES * v]
+        zone_cards = torch.bmm(zones.reshape(batch, self.NUM_ZONES, v), card_repr)
+        return torch.cat(
+            [
+                globals_sec,
+                slot_rest.reshape(batch, -1),
+                slot_cards.reshape(batch, -1),
+                zone_cards.reshape(batch, -1),
+            ],
+            dim=-1,
+        )
+
+    def _embed_actions(self, act_feats: torch.Tensor, card_repr: torch.Tensor) -> torch.Tensor:
+        """Replace the action card one-hot with its card embedding."""
+        v = self.vocab
+        onehot = act_feats[:, :, self.ACT_CLASSES : self.ACT_CLASSES + v]
+        card = torch.bmm(onehot, card_repr)
+        rest = torch.cat(
+            [act_feats[:, :, : self.ACT_CLASSES], act_feats[:, :, self.ACT_CLASSES + v :]],
+            dim=-1,
+        )
+        return torch.cat([rest, card], dim=-1)
+
+    def policy_logits(
+        self,
+        obs: torch.Tensor,
+        act_feats: torch.Tensor,
+        mask: torch.Tensor,
+        h: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        card_repr = self._card_repr(obs)
+        state = self.obs_encoder(self._flatten_obs(obs, card_repr))
+        if self.gru is not None:
+            h = self.gru(state, h)
+            state = h
+        emb_feats = self._embed_actions(act_feats, card_repr)
+        logits = self._score_actions(state, emb_feats, mask)
+        return logits, h if self.gru is not None else None
+
+    def policy_logits_seq(
+        self,
+        obs: torch.Tensor,
+        act_feats: torch.Tensor,
+        mask: torch.Tensor,
+        h0: torch.Tensor | None,
+        resets: torch.Tensor,
+    ) -> torch.Tensor:
+        steps, batch = obs.shape[0], obs.shape[1]
+        flat_obs = obs.reshape(steps * batch, -1)
+        card_repr = self._card_repr(flat_obs)
+        flat_state = self.obs_encoder(self._flatten_obs(flat_obs, card_repr))
+        if self.gru is None:
+            states = flat_state
+        else:
+            state_seq = flat_state.reshape(steps, batch, -1)
+            h = h0
+            hs = []
+            for t in range(steps):
+                h = h * (1.0 - resets[t]).unsqueeze(-1)
+                h = self.gru(state_seq[t], h)
+                hs.append(h)
+            states = torch.stack(hs).reshape(steps * batch, -1)
+        emb_feats = self._embed_actions(
+            act_feats.reshape(steps * batch, *act_feats.shape[2:]), card_repr
+        )
+        return self._score_actions(states, emb_feats, mask.reshape(steps * batch, -1))
+
+    def value(self, oracle_obs: torch.Tensor) -> torch.Tensor:
+        card_repr = self._card_repr(oracle_obs)
+        state = self.critic_encoder(self._flatten_obs(oracle_obs, card_repr))
+        return self.value_head(state).squeeze(-1)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        oracle_obs: torch.Tensor,
+        act_feats: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.gru is None, "recurrent agents must use policy_logits_seq for updates"
+        logits, _ = self.policy_logits(obs, act_feats, mask)
+        return logits, self.value(oracle_obs)
+
+
 class ResAttnAgent(_AttnScorerBase):
     """Residual trunk + self-attention over the legal-action set.
 
@@ -391,15 +594,27 @@ def make_agent(
     memory: bool = False,
     belief: bool = False,
     oracle: bool = False,
+    card_table: tuple | None = None,
 ) -> nn.Module:
     agent = _build_agent(
-        obs_dim, act_feat_dim, arch, hidden, blocks, heads, memory, belief
+        obs_dim, act_feat_dim, arch, hidden, blocks, heads, memory, belief, card_table
     )
     # Oracle agents feed the full-state view to the *policy* (an all-knowing
     # player, like the engine bots). The flag lives in the config so eval and
     # self-play route the right observation automatically.
     agent.config["oracle"] = oracle
     return agent
+
+
+def fetch_card_table() -> tuple[torch.Tensor, int]:
+    """Global card attribute table from the engine: (attr_table, num_cards).
+    The table has num_cards + 1 rows (last = padding id)."""
+    import deckgym
+
+    flat, attr_dim = deckgym.card_attr_table()
+    num_cards = deckgym.num_global_cards()
+    table = torch.from_numpy(flat.reshape(num_cards + 1, attr_dim))
+    return table, num_cards
 
 
 def _build_agent(
@@ -411,7 +626,23 @@ def _build_agent(
     heads: int,
     memory: bool,
     belief: bool,
+    card_table: tuple | None = None,
 ) -> nn.Module:
+    if arch == "gen":
+        if belief:
+            raise ValueError("--aux-belief is not supported with --arch gen")
+        attr_table, num_cards = card_table if card_table is not None else fetch_card_table()
+        return GeneralAgent(
+            obs_dim,
+            act_feat_dim,
+            hidden=hidden or 384,
+            blocks=blocks if blocks is not None else 3,
+            heads=heads,
+            memory=memory,
+            num_cards=num_cards,
+            attr_dim=attr_table.shape[1],
+            attr_table=attr_table,
+        )
     if arch == "res":
         return ResAttnAgent(
             obs_dim,
@@ -443,6 +674,7 @@ _ARCH_CLASSES = {
     "mlp": ActionScorerAgent,
     "res": ResAttnAgent,
     "tx": TokenTransformerAgent,
+    "gen": GeneralAgent,
 }
 
 

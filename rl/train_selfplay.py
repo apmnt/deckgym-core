@@ -41,8 +41,13 @@ from torch_runtime import (
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--deck", default="example_decks/venusaur-exeggutor.txt")
-    p.add_argument("--opponent-deck", default=None, help="defaults to --deck (mirror match)")
+    p.add_argument(
+        "--deck",
+        default="example_decks/venusaur-exeggutor.txt",
+        help="seat-0 deck: file, folder of decks, or comma-separated list "
+        "(a pool is sampled per episode — use folders for deck-general training)",
+    )
+    p.add_argument("--opponent-deck", default=None, help="seat-1 deck spec (defaults to --deck)")
     p.add_argument("--total-steps", type=int, default=3_000_000)
     p.add_argument("--num-envs", type=int, default=32)
     p.add_argument("--num-steps", type=int, default=256, help="rollout length per env")
@@ -72,7 +77,10 @@ def parse_args():
     p.add_argument("--num-minibatches", type=int, default=8)
     p.add_argument("--shaping", type=float, default=0.0, help="potential-based shaping coef")
     p.add_argument(
-        "--arch", choices=["res", "tx", "mlp"], default="res", help="network architecture"
+        "--arch",
+        choices=["res", "tx", "mlp", "gen"],
+        default="res",
+        help="network architecture (gen = deck-general card-embedding agent)",
     )
     p.add_argument("--hidden", type=int, default=None, help="trunk width (default: arch default)")
     p.add_argument(

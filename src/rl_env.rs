@@ -11,20 +11,31 @@
 //! logit per action, so no global action enumeration is needed.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
+use strum::IntoEnumIterator;
 
 use crate::actions::{apply_action, Action, SimpleAction};
+use crate::card_ids::CardId;
+use crate::database::get_card_by_enum;
 use crate::deck::Deck;
-use crate::models::{Card, EnergyType};
-use crate::players::Player;
+use crate::models::{Card, EnergyType, TrainerType};
+use crate::players::{create_players, Player, PlayerCode};
 use crate::state::GameOutcome;
 use crate::State;
 
 /// Hard cap on legal actions encoded per decision. The engine rarely exceeds
 /// a few dozen; exceeding the cap is a hard error so it is never silent.
 pub const MAX_ACTIONS: usize = 128;
+
+/// Fixed size of the per-match card vocabulary sections in observations and
+/// action features. Two 20-card decks contain at most 40 distinct cards, so
+/// any matchup fits; unused slots stay zero. A fixed size makes the
+/// observation/action dims independent of the decks being played, which is
+/// what lets a single network play any deck against any deck.
+pub const VOCAB_SIZE: usize = 40;
 
 const NUM_ENERGY_TYPES: usize = 10;
 const NUM_STATUS: usize = 5;
@@ -33,6 +44,96 @@ const NUM_SLOTS: usize = 4; // active + 3 bench
 const MAX_POINTS: f32 = 3.0;
 const MAX_TURNS: f32 = 30.0;
 const MAX_COPIES: f32 = 2.0;
+
+/// Stable global index for every card in the engine: the position of its
+/// `CardId` in enum-definition order. Index `num_global_cards()` is reserved
+/// as the padding id for empty vocabulary slots.
+static GLOBAL_CARD_INDEX: LazyLock<HashMap<CardId, u32>> = LazyLock::new(|| {
+    CardId::iter()
+        .enumerate()
+        .map(|(i, card_id)| (card_id, i as u32))
+        .collect()
+});
+
+pub fn num_global_cards() -> usize {
+    GLOBAL_CARD_INDEX.len()
+}
+
+fn global_card_index(card: &Card) -> u32 {
+    GLOBAL_CARD_INDEX
+        .get(&card.get_card_id())
+        .copied()
+        .unwrap_or(num_global_cards() as u32)
+}
+
+/// Static per-card attribute features (see `write_card_attrs` for layout).
+/// These give the network semantics for cards it has rarely (or never) seen:
+/// an unfamiliar card is still "a 120-HP stage-1 water Pokemon with a 60-dmg
+/// two-energy attack". Identity embeddings capture the rest.
+pub const CARD_ATTR_DIM: usize = 45;
+const MAX_ATTACKS: usize = 3;
+
+fn write_card_attrs(card: &Card, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), CARD_ATTR_DIM);
+    out.fill(0.0);
+    match card {
+        Card::Pokemon(pokemon) => {
+            out[0] = 1.0;
+            out[6 + energy_index(pokemon.energy_type)] = 1.0;
+            out[16] = pokemon.stage as f32 / 2.0;
+            out[17] = pokemon.hp as f32 / 300.0;
+            out[19] = pokemon.retreat_cost.len() as f32 / 4.0;
+            if let Some(weakness) = pokemon.weakness {
+                out[20 + energy_index(weakness)] = 1.0;
+            }
+        }
+        Card::Trainer(trainer) => {
+            let type_idx = match trainer.trainer_card_type {
+                TrainerType::Supporter => 0,
+                TrainerType::Item => 1,
+                TrainerType::Tool => 2,
+                TrainerType::Fossil => 3,
+                TrainerType::Stadium => 4,
+            };
+            out[1 + type_idx] = 1.0;
+        }
+    }
+    out[18] = card.is_ex() as u8 as f32;
+    out[30] = card.get_ability().is_some() as u8 as f32;
+    out[31] = card.is_basic() as u8 as f32;
+    let attacks = card.get_attacks();
+    out[32] = attacks.len() as f32 / MAX_ATTACKS as f32;
+    for (k, attack) in attacks.iter().take(MAX_ATTACKS).enumerate() {
+        let j = 33 + 4 * k;
+        out[j] = 1.0;
+        out[j + 1] = attack.fixed_damage as f32 / 200.0;
+        out[j + 2] = attack.energy_required.len() as f32 / 4.0;
+        out[j + 3] = attack.effect.is_some() as u8 as f32;
+    }
+}
+
+/// Flat `(num_global_cards() + 1) x CARD_ATTR_DIM` attribute table in global
+/// index order; the final row (the padding id) is all zeros.
+pub fn card_attr_table() -> Vec<f32> {
+    let n = num_global_cards();
+    let mut table = vec![0.0f32; (n + 1) * CARD_ATTR_DIM];
+    for card_id in CardId::iter() {
+        let card = get_card_by_enum(card_id);
+        let idx = global_card_index(&card) as usize;
+        write_card_attrs(
+            &card,
+            &mut table[idx * CARD_ATTR_DIM..(idx + 1) * CARD_ATTR_DIM],
+        );
+    }
+    table
+}
+
+/// Card id strings in global index order (for debugging/tooling).
+pub fn global_card_ids() -> Vec<String> {
+    CardId::iter()
+        .map(|card_id| get_card_by_enum(card_id).get_id())
+        .collect()
+}
 
 fn energy_index(energy: EnergyType) -> usize {
     match energy {
@@ -121,9 +222,7 @@ fn action_target(action: &SimpleAction) -> Option<(usize, Option<usize>)> {
         | SimpleAction::AttachFromDiscard { in_play_idx, .. }
         | SimpleAction::DiscardFossil { in_play_idx }
         | SimpleAction::ReturnPokemonToHand { in_play_idx }
-        | SimpleAction::ShuffleInPlayPokemonIntoDeck { in_play_idx } => {
-            Some((*in_play_idx, None))
-        }
+        | SimpleAction::ShuffleInPlayPokemonIntoDeck { in_play_idx } => Some((*in_play_idx, None)),
         SimpleAction::Retreat(idx) => Some((*idx, None)),
         SimpleAction::Activate { in_play_idx, .. } => Some((*in_play_idx, None)),
         SimpleAction::MoveEnergy { to_in_play_idx, .. } => Some((*to_in_play_idx, None)),
@@ -138,9 +237,10 @@ fn action_target(action: &SimpleAction) -> Option<(usize, Option<usize>)> {
             target_in_play_idx,
             ..
         } => Some((*target_in_play_idx, Some(*target_player))),
-        SimpleAction::DiscardToolFromPokemon { player, in_play_idx } => {
-            Some((*in_play_idx, Some(*player)))
-        }
+        SimpleAction::DiscardToolFromPokemon {
+            player,
+            in_play_idx,
+        } => Some((*in_play_idx, Some(*player))),
         _ => None,
     }
 }
@@ -185,29 +285,38 @@ fn action_scalars(action: &SimpleAction) -> (f32, f32, f32) {
     }
 }
 
-/// Vocabulary of the card IDs reachable in a match between two decks.
+/// Vocabulary of the card IDs reachable in a match between two decks. Local
+/// indices are match-specific; `global_ids` maps each local slot to the
+/// engine-wide card index so a network can look up per-card embeddings.
 #[derive(Debug, Clone)]
 pub struct CardVocab {
     ids: Vec<String>,
     index: HashMap<String, usize>,
+    global_ids: Vec<u32>,
 }
 
 impl CardVocab {
     pub fn from_decks(deck_a: &Deck, deck_b: &Deck) -> Self {
-        let mut ids: Vec<String> = deck_a
-            .cards
-            .iter()
-            .chain(deck_b.cards.iter())
-            .map(|c| c.get_id())
-            .collect();
-        ids.sort();
-        ids.dedup();
+        let mut cards: Vec<&Card> = deck_a.cards.iter().chain(deck_b.cards.iter()).collect();
+        cards.sort_by_key(|c| c.get_id());
+        cards.dedup_by_key(|c| c.get_id());
+        assert!(
+            cards.len() <= VOCAB_SIZE,
+            "matchup has {} distinct cards, exceeding VOCAB_SIZE={VOCAB_SIZE}",
+            cards.len()
+        );
+        let ids: Vec<String> = cards.iter().map(|c| c.get_id()).collect();
         let index = ids
             .iter()
             .enumerate()
             .map(|(i, id)| (id.clone(), i))
             .collect();
-        CardVocab { ids, index }
+        let global_ids = cards.iter().map(|c| global_card_index(c)).collect();
+        CardVocab {
+            ids,
+            index,
+            global_ids,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -221,6 +330,16 @@ impl CardVocab {
     fn index_of(&self, card: &Card) -> Option<usize> {
         self.index.get(&card.get_id()).copied()
     }
+
+    /// Global card index per local slot, padded to `VOCAB_SIZE` with the
+    /// reserved padding id (`num_global_cards()`).
+    fn write_global_ids(&self, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), VOCAB_SIZE);
+        let pad = num_global_cards() as f32;
+        for (slot, value) in out.iter_mut().enumerate() {
+            *value = self.global_ids.get(slot).map_or(pad, |&id| id as f32);
+        }
+    }
 }
 
 /// Single-agent RL view of one game.
@@ -231,6 +350,13 @@ impl CardVocab {
 /// `pending_actor`; the caller supplies both seats' actions. Rewards and
 /// outcomes are always from seat 0's perspective.
 pub struct RlEnvCore {
+    /// Per-seat deck pools; each episode samples one deck per seat, so a
+    /// single env can train across every pairing of the pools.
+    deck_pool_a: Vec<Deck>,
+    deck_pool_b: Vec<Deck>,
+    /// Engine bot for seat 1 (rebuilt per episode with the sampled decks);
+    /// `None` = self-play mode, the caller supplies both seats' actions.
+    opponent_code: Option<PlayerCode>,
     deck_a: Deck,
     deck_b: Deck,
     opponent: Option<Box<dyn Player>>,
@@ -256,18 +382,46 @@ pub struct StepResult {
 }
 
 impl RlEnvCore {
+    /// Single fixed matchup (the original behavior).
     pub fn new(
         deck_a: Deck,
         deck_b: Deck,
-        opponent: Option<Box<dyn Player>>,
+        opponent_code: Option<PlayerCode>,
         seed: u64,
         shaping_coef: f32,
     ) -> Self {
+        Self::new_with_pools(
+            vec![deck_a],
+            vec![deck_b],
+            opponent_code,
+            seed,
+            shaping_coef,
+        )
+    }
+
+    /// Multi-deck env: each episode samples one deck per seat from that
+    /// seat's pool, so training covers every pairing of the pools.
+    pub fn new_with_pools(
+        deck_pool_a: Vec<Deck>,
+        deck_pool_b: Vec<Deck>,
+        opponent_code: Option<PlayerCode>,
+        seed: u64,
+        shaping_coef: f32,
+    ) -> Self {
+        assert!(
+            !deck_pool_a.is_empty() && !deck_pool_b.is_empty(),
+            "deck pools must be non-empty"
+        );
+        let deck_a = deck_pool_a[0].clone();
+        let deck_b = deck_pool_b[0].clone();
         let vocab = CardVocab::from_decks(&deck_a, &deck_b);
         let mut env = RlEnvCore {
+            deck_pool_a,
+            deck_pool_b,
+            opponent_code,
             deck_a,
             deck_b,
-            opponent,
+            opponent: None,
             vocab,
             rng: StdRng::seed_from_u64(seed),
             state: State::default(),
@@ -285,13 +439,13 @@ impl RlEnvCore {
     }
 
     pub fn obs_dim(&self) -> usize {
-        let v = self.vocab.len();
-        // globals + 8 board slots + 6 card-count sections (hands/discards/decks)
-        58 + 2 * NUM_SLOTS * (23 + v) + 6 * v
+        // globals + 8 board slots + 6 card-count sections (hands/discards/
+        // decks) + the vocabulary's global card ids (for embedding lookup).
+        58 + 2 * NUM_SLOTS * (23 + VOCAB_SIZE) + 6 * VOCAB_SIZE + VOCAB_SIZE
     }
 
     pub fn action_feat_dim(&self) -> usize {
-        NUM_ACTION_CLASSES + self.vocab.len() + NUM_SLOTS + 1 + 4 + NUM_ENERGY_TYPES + 3
+        NUM_ACTION_CLASSES + VOCAB_SIZE + NUM_SLOTS + 1 + 4 + NUM_ENERGY_TYPES + 3
     }
 
     pub fn num_actions(&self) -> usize {
@@ -326,10 +480,46 @@ impl RlEnvCore {
     }
 
     fn reset_internal(&mut self) {
+        if self.deck_pool_a.len() > 1 {
+            let idx = self.rng.gen_range(0..self.deck_pool_a.len());
+            self.deck_a = self.deck_pool_a[idx].clone();
+        }
+        if self.deck_pool_b.len() > 1 {
+            let idx = self.rng.gen_range(0..self.deck_pool_b.len());
+            self.deck_b = self.deck_pool_b[idx].clone();
+        }
+        self.vocab = CardVocab::from_decks(&self.deck_a, &self.deck_b);
+        // The bot holds a deck; rebuild it for the sampled matchup.
+        self.opponent = self.opponent_code.clone().map(|code| {
+            create_players(
+                self.deck_a.clone(),
+                self.deck_b.clone(),
+                vec![code.clone(), code],
+            )
+            .into_iter()
+            .nth(1)
+            .unwrap()
+        });
         self.state = State::initialize(&self.deck_a, &self.deck_b, &mut self.rng);
         self.prev_potential = 0.0;
         self.advance_until_agent_decision();
         debug_assert!(!self.state.is_game_over());
+    }
+
+    /// Ask a freshly built engine bot (for the current matchup) to choose
+    /// among the pending actions, returning the chosen index without
+    /// stepping. Used to mix engine bots into self-play opponent rosters
+    /// and to collect demonstration games.
+    pub fn decide_with_code(&mut self, code: &PlayerCode) -> usize {
+        let mut bot = create_players(
+            self.deck_a.clone(),
+            self.deck_b.clone(),
+            vec![code.clone(), code.clone()],
+        )
+        .into_iter()
+        .nth(1)
+        .unwrap();
+        self.decide_with(bot.as_mut())
     }
 
     /// Apply the `idx`-th legal action for the pending actor, then roll the
@@ -385,11 +575,11 @@ impl RlEnvCore {
             if actions.len() == 1 {
                 apply_action(&mut self.rng, &mut self.state, &actions[0]);
             } else if actor == OPPONENT && self.opponent.is_some() {
-                let action = self
-                    .opponent
-                    .as_mut()
-                    .unwrap()
-                    .decision_fn(&mut self.rng, &self.state, &actions);
+                let action = self.opponent.as_mut().unwrap().decision_fn(
+                    &mut self.rng,
+                    &self.state,
+                    &actions,
+                );
                 apply_action(&mut self.rng, &mut self.state, &action);
             } else {
                 assert!(
@@ -417,7 +607,7 @@ impl RlEnvCore {
         let state = &self.state;
         let me = perspective;
         let them = 1 - perspective;
-        let v = self.vocab.len();
+        let v = VOCAB_SIZE;
         let mut i = 0;
 
         // Globals (58)
@@ -496,7 +686,11 @@ impl RlEnvCore {
             i += v;
         }
         for player in [me, them] {
-            count_cards(&state.discard_piles[player], &self.vocab, &mut out[i..i + v]);
+            count_cards(
+                &state.discard_piles[player],
+                &self.vocab,
+                &mut out[i..i + v],
+            );
             i += v;
         }
         for player in [me, them] {
@@ -505,6 +699,14 @@ impl RlEnvCore {
             }
             i += v;
         }
+
+        // Global card ids of the vocabulary slots (as f32 — exact for ids
+        // below 2^24). This tells an embedding-based network *which* cards
+        // the local one-hot/count sections refer to. Both decklists are
+        // considered public knowledge (like the metagame), but the
+        // opponent's hand and remaining deck contents stay hidden above.
+        self.vocab.write_global_ids(&mut out[i..i + VOCAB_SIZE]);
+        i += VOCAB_SIZE;
         debug_assert_eq!(i, self.obs_dim());
     }
 
@@ -513,7 +715,7 @@ impl RlEnvCore {
         let dim = self.action_feat_dim();
         debug_assert_eq!(out.len(), MAX_ACTIONS * dim);
         out.fill(0.0);
-        let v = self.vocab.len();
+        let v = VOCAB_SIZE;
         for (slot, action) in self.pending_actions.iter().enumerate() {
             let simple = &action.action;
             let row = &mut out[slot * dim..(slot + 1) * dim];
@@ -567,13 +769,10 @@ fn count_cards(cards: &[Card], vocab: &CardVocab, out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::players::RandomPlayer;
-    use rand::Rng;
 
     fn make_env(seed: u64) -> RlEnvCore {
         let deck = Deck::from_file("example_decks/venusaur-exeggutor.txt").unwrap();
-        let opponent = Box::new(RandomPlayer { deck: deck.clone() });
-        RlEnvCore::new(deck.clone(), deck, Some(opponent), seed, 0.0)
+        RlEnvCore::new(deck.clone(), deck, Some(PlayerCode::R), seed, 0.0)
     }
 
     #[test]
@@ -640,11 +839,63 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_deck_pool_sampling() {
+        let decks: Vec<Deck> = [
+            "example_decks/venusaur-exeggutor.txt",
+            "example_decks/weezing-arbok.txt",
+            "example_decks/mewtwoex.txt",
+        ]
+        .iter()
+        .map(|p| Deck::from_file(p).unwrap())
+        .collect();
+        let mut env = RlEnvCore::new_with_pools(decks.clone(), decks, Some(PlayerCode::R), 3, 0.0);
+        let obs_dim = env.obs_dim();
+        let mut obs = vec![0.0; obs_dim];
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut vocab_signatures = std::collections::HashSet::new();
+        let mut episodes = 0;
+        let mut steps = 0;
+        while episodes < 12 {
+            env.write_observation(&mut obs, AGENT, false);
+            // Dims are fixed regardless of the sampled matchup; the id
+            // section identifies the cards, padded with num_global_cards().
+            let ids = &obs[obs_dim - VOCAB_SIZE..];
+            assert!(ids
+                .iter()
+                .all(|&id| id >= 0.0 && id <= num_global_cards() as f32));
+            vocab_signatures.insert(ids.iter().map(|&id| id as u32).collect::<Vec<_>>());
+            let idx = rng.gen_range(0..env.num_actions());
+            if env.step(idx).done {
+                episodes += 1;
+            }
+            steps += 1;
+            assert!(steps < 20_000, "episodes should terminate");
+        }
+        // 3x3 deck pairings: several distinct vocabularies must appear.
+        assert!(
+            vocab_signatures.len() >= 3,
+            "expected multiple matchup vocabularies, saw {}",
+            vocab_signatures.len()
+        );
+    }
+
+    #[test]
+    fn test_card_attr_table_shape() {
+        let table = card_attr_table();
+        let n = num_global_cards();
+        assert_eq!(table.len(), (n + 1) * CARD_ATTR_DIM);
+        // Padding row is all zeros.
+        assert!(table[n * CARD_ATTR_DIM..].iter().all(|&x| x == 0.0));
+        // Every real row is finite and at least one field is set.
+        assert!(table.iter().all(|x| x.is_finite()));
+        assert_eq!(global_card_ids().len(), n);
+    }
+
+    #[test]
     fn test_shaping_telescopes() {
         // With shaping, an episode's total reward must still equal the outcome.
         let deck = Deck::from_file("example_decks/venusaur-exeggutor.txt").unwrap();
-        let opponent = Box::new(RandomPlayer { deck: deck.clone() });
-        let mut env = RlEnvCore::new(deck.clone(), deck, Some(opponent), 11, 0.5);
+        let mut env = RlEnvCore::new(deck.clone(), deck, Some(PlayerCode::R), 11, 0.5);
         let mut rng = StdRng::seed_from_u64(3);
         for _ in 0..5 {
             let mut episode_reward = 0.0;
