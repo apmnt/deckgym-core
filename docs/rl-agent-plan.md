@@ -211,3 +211,45 @@ Lessons so far:
   critic carried stage 2 to ~96% vs `v`.
 - Training SPS on 4 CPU cores: ~900 vs `r`/`v`, ~360 vs `e2` (opponent runs
   a depth-2 search per move).
+
+## Phase 10 — deck-general agent (any deck vs any deck)
+
+Goal: one network that plays *any* deck against *any* deck at
+expectiminimax-beating strength, instead of a per-matchup specialist.
+
+Literature the design follows: **ygo-agent** represents every card by an id
+embedding fused with per-card feature vectors so one policy generalizes
+across decks; **Cardsformer** (Hearthstone) shows card attribute/text
+grounding is what transfers to unseen cards; deck-building work (Dockhorn et
+al.) reaches the same conclusion for changing card pools. The champion
+recipe from phases 6–8 (BC warm start → PFSP with engine bots) is kept
+unchanged — only the representation and the training distribution change.
+
+Design:
+
+- **Fixed-dim observations** (`VOCAB_SIZE = 40`): the per-match card
+  vocabulary sections are padded to 40 slots and the observation carries
+  each slot's *global card id* (stable index over the engine's full card
+  enum, 3406 cards). Board one-hots, zone counts, and action card
+  references stay in local-vocab space, so the tensor layout is identical
+  for every matchup.
+- **`GeneralAgent` (`--arch gen`)**: a `CardEncoder` maps global ids to
+  d=64 vectors — learned identity embedding **plus a projection of static
+  card attributes** (HP, type, stage, ex, retreat, attack damage/cost/
+  effect flags, trainer kind; `deckgym.card_attr_table()`, 45 dims). All
+  local one-hot/count sections are projected through the per-match card
+  matrix (`counts @ card_repr`) before the residual trunk; action features
+  are re-embedded the same way, then scored by the usual action-attention
+  head. ~3.1M params at hidden 384 x 3 blocks; ~810 SPS vs `r` on 4 cores.
+- **Per-episode deck sampling**: every deck spec (`--deck`,
+  `--opponent-deck`) may be a file, folder, comma list, or `.pool` file;
+  each episode samples one deck per seat. Standard split:
+  `rl/pools/train.pool` (25 example decks), `rl/pools/heldout.pool`
+  (4 decks never trained on, for zero-shot eval).
+- Decklists are treated as **public information** (both vocabularies are
+  visible — like knowing the metagame); the opponent's hand and remaining
+  deck stay hidden as before, and engine bots still see everything.
+
+Recipe (rl/run_general.sh): BC-distill e3-vs-e3 games sampled across all
+train-pool pairings, then PFSP self-play with e1/e2/e3 anchoring the
+roster, sampling random deck pairs per episode throughout.
