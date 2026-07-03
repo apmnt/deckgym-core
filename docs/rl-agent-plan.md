@@ -396,3 +396,25 @@ Note also e3's own seat-0 mean is 47.5%, so "beat e3" (>50%) requires
 out-piloting an opponent that sees our hand, not merely matching it —
 which the mirror result (55.7% vs e3) proves is possible per-matchup.
 Focused legs now target the largest gaps.
+
+### Phase 12 continued: interleaved oversampling works, long runs drift
+
+Sequential focus legs were **zero-sum** (focus decks +1.0pp mean,
+non-focus −2.8pp, aggregate 40% → 35.5%): each leg's lift eroded once its
+deck left the training distribution, only the final legs' lifts survived
+(arceusdialga +12.5pp, baby-mega-blaziken +14.4pp held).
+
+The fix — **interleaved oversampling** (one run, seat-0 spec = all 25
+decks + the 10 skill-gap decks repeated 2 extra times, seat-1 = uniform
+pool) — set a new pool-wide best: **44.0%** [39.2, 48.9] vs e3 at 180k
+steps (from the 40% gen_m2 baseline; milestone metric always measured on
+the *unweighted* pool). But by 500k the same run had drifted back to
+39.3% — the recurring "drift away from the hardest opponent" failure.
+Current recipe therefore: short bursts (~150k) from the best checkpoint
+with full pooled evals between rounds, keeping the better checkpoint each
+time (hill-climbing on the milestone metric directly).
+
+Engine fixes shipped along the way: rare no-legal-move deadlock states
+are now scored as ties (mid-episode and during reset re-deals), which had
+crashed evaluation; and note `uv run` re-syncs a stale cached deckgym
+wheel over a fresh `maturin develop` build — use `uv run --no-sync`.
