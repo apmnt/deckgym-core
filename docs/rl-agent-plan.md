@@ -253,3 +253,51 @@ Design:
 Recipe (rl/run_general.sh): BC-distill e3-vs-e3 games sampled across all
 train-pool pairings, then PFSP self-play with e1/e2/e3 anchoring the
 roster, sampling random deck pairs per episode throughout.
+
+### Phase 10 results
+
+All numbers are greedy-policy win rates on *random matchups* from the given
+pool, pooled over 2 seeds (≈400 episodes vs each opponent unless noted;
+±5pp). "e<N>" = expectiminimax depth N, which sees the agent's hand.
+
+| Checkpoint | r | e1 | e2 | e3 |
+|---|---|---|---|---|
+| BC v1 (6k games, 5 epochs, 79.8% top-1) | 97.5% | 80.1% | 43.8% | 36.1% |
+| BC 12k games, 8 epochs (95.5% train acc — overfit) | 97.1% | 80.6% | 38.3% | 28.4% |
+| BC 12k games, 4 epochs | 98.5% | 76.7% | 44.1% | 32.3% |
+| PFSP run 2 (800k steps from BC v1) | 98.3% | 75.5% | 43.4% | 39.7% |
+| **PFSP run 3 (+400k from run 2)** — `general_pfsp.pt` | **98.3%** | **79.5%** | **48.2%** | **38.1%** |
+
+Zero-shot on the four held-out decks (never in training data), PFSP run 3:
+**74.3% vs e1, 36.2% vs e2, 26.4% vs e3** — most of the in-pool strength
+transfers to unseen decks, with the gap growing with search depth.
+
+Lessons:
+
+- **BC-warm-started PPO needs conservative updates at this scale.** The
+  champion's self-play hyperparameters (lr 2.5e-4, 4 epochs, no KL guard)
+  *collapsed* the general agent: approx-KL ran ~0.06/update and greedy
+  e2 fell 43.8% → 21% within 165k steps. With `--lr 1e-4 --target-kl 0.02
+  --clip-vloss` the same run holds KL ≈ 0.01, never regresses, and gains
+  +4.8pp vs e2 / +2pp vs e3 over 1.2M total steps. The bigger net and the
+  multi-matchup gradient mix — not the recipe structure — were the
+  difference from the mirror-match runs.
+- **BC plateaus; more demonstrations don't move it.** Doubling the dataset
+  (167k → 333k decisions) at the working epoch count reproduced BC v1
+  exactly (44.1% vs 43.8% e2); pushing epochs instead overfit badly
+  (train top-1 95.5%, e3 36.1% → 28.4%). The ~44% e2 / ~36% e3 BC ceiling
+  appears to be representation/demonstrator-limited, not data-limited.
+- **Attribute-grounded card embeddings transfer.** Zero-shot e1
+  performance (74.3%) nearly matches in-pool (79.5%); the transfer gap
+  widens against deeper search (e2 −12pp, e3 −12pp), i.e. tactical
+  generalization transfers more readily than the fine matchup knowledge
+  deeper search punishes.
+- Training a 3.1M-param net on 4 CPU cores: BC collection ~7.5 games/s
+  (48 envs, e3 both seats), self-play ~55–98 SPS depending on how often
+  PFSP samples e3.
+
+Next steps toward >50% vs e3 in the general setting: a larger/wider net
+(the BC ablation's width gains were untested here), per-card *token*
+observations (hand/board as card tokens instead of zone count vectors —
+the tx-arch direction), longer PFSP with league-style exploiters, and BC
+from a stronger demonstrator (e4).

@@ -19,7 +19,24 @@ history and lessons: `docs/rl-agent-plan.md`.
 The mirror-match agents above are matchup specialists: their observation
 one-hots cards over the *match's* vocabulary, so the input meaning changes
 with the decks. `--arch gen` is the deck-general agent — **one network that
-plays any deck against any deck**:
+plays any deck against any deck**.
+
+**Current best general agent** (`rl/checkpoints/general_pfsp.pt`, ~3.1M
+params; greedy, pooled 2 seeds x 200 episodes, random matchups):
+
+| Opponent | Train pool (25 decks) | Held-out decks (zero-shot) |
+|---|---|---|
+| `r` random | 98.3% | — |
+| `e1` expectiminimax-1 | **79.5%** | **74.3%** |
+| `e2` expectiminimax-2 | 48.2% | 36.2% |
+| `e3` expectiminimax-3 | 38.1% | 26.4% |
+
+It plays blind (hidden opponent hand/deck) against search bots that see
+everything, across all 625 train-pool pairings with a single set of
+weights — and transfers most of that strength to decks it never trained
+on. The BC-only warm start (`rl/checkpoints/general_bc.pt`) sits at
+43.8%/36.1% vs e2/e3 in-pool. Full experiment log: `docs/rl-agent-plan.md`
+phase 10.
 
 - The env pads every card-vocabulary section to a fixed 40 slots and appends
   each slot's *global* card id to the observation, so observation/action
