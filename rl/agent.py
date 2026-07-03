@@ -248,10 +248,18 @@ class CardEncoder(nn.Module):
     (ygo-agent / Cardsformer pattern). Index `num_cards` is the padding id
     (zero embedding, zero attribute row)."""
 
-    def __init__(self, num_cards: int, attr_dim: int, d_card: int, attr_table=None):
+    def __init__(
+        self,
+        num_cards: int,
+        attr_dim: int,
+        d_card: int,
+        attr_table=None,
+        fusion: str = "sum",
+    ):
         super().__init__()
         self.emb = nn.Embedding(num_cards + 1, d_card, padding_idx=num_cards)
         self.attr_proj = nn.Linear(attr_dim, d_card)
+        self.fusion = fusion
         if attr_table is None:
             attr_table = torch.zeros(num_cards + 1, attr_dim)
         assert attr_table.shape == (num_cards + 1, attr_dim)
@@ -260,7 +268,12 @@ class CardEncoder(nn.Module):
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """ids: [..., V] long → [..., V, d_card]."""
-        return self.emb(ids) + self.attr_proj(self.attr_table[ids])
+        attrs = self.attr_proj(self.attr_table[ids])
+        if self.fusion == "mul":
+            # ygo-agent style: the attribute projection gates the identity
+            # embedding (features MLP output multiplied by the id embedding).
+            return self.emb(ids) * nn.functional.silu(attrs)
+        return self.emb(ids) + attrs
 
 
 class GeneralAgent(_AttnScorerBase):
@@ -298,6 +311,7 @@ class GeneralAgent(_AttnScorerBase):
         d_card: int = 64,
         vocab: int = 40,
         attr_table=None,
+        fusion: str = "sum",
     ):
         super().__init__()
         assert num_cards > 0 and attr_dim > 0, "gen arch needs the global card table"
@@ -318,10 +332,11 @@ class GeneralAgent(_AttnScorerBase):
             "attr_dim": attr_dim,
             "d_card": d_card,
             "vocab": vocab,
+            "fusion": fusion,
         }
         self.vocab = vocab
         self.d_card = d_card
-        self.cards = CardEncoder(num_cards, attr_dim, d_card, attr_table)
+        self.cards = CardEncoder(num_cards, attr_dim, d_card, attr_table, fusion)
         trunk_in = (
             self.GLOBALS + self.NUM_SLOTS * (self.SLOT_NUM + d_card) + self.NUM_ZONES * d_card
         )
@@ -595,9 +610,10 @@ def make_agent(
     belief: bool = False,
     oracle: bool = False,
     card_table: tuple | None = None,
+    fusion: str = "sum",
 ) -> nn.Module:
     agent = _build_agent(
-        obs_dim, act_feat_dim, arch, hidden, blocks, heads, memory, belief, card_table
+        obs_dim, act_feat_dim, arch, hidden, blocks, heads, memory, belief, card_table, fusion
     )
     # Oracle agents feed the full-state view to the *policy* (an all-knowing
     # player, like the engine bots). The flag lives in the config so eval and
@@ -640,6 +656,7 @@ def _build_agent(
     memory: bool,
     belief: bool,
     card_table: tuple | None = None,
+    fusion: str = "sum",
 ) -> nn.Module:
     if arch == "gen":
         if belief:
@@ -655,6 +672,7 @@ def _build_agent(
             num_cards=num_cards,
             attr_dim=attr_table.shape[1],
             attr_table=attr_table,
+            fusion=fusion,
         )
     if arch == "res":
         return ResAttnAgent(

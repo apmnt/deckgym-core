@@ -51,6 +51,12 @@ def parse_args():
         help="text-feature .npy (rl/build_text_features.py) appended to the "
         "card attribute table (--arch gen only)",
     )
+    p.add_argument(
+        "--fusion",
+        choices=["sum", "mul"],
+        default="sum",
+        help="CardEncoder id/attribute fusion (mul = ygo-agent style gating)",
+    )
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)
@@ -160,6 +166,7 @@ def main():
         belief=args.aux_belief > 0,
         oracle=args.oracle,
         card_table=card_table,
+        fusion=args.fusion,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 
