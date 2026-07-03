@@ -376,3 +376,23 @@ Bonus finding that shapes M2 (beat e3 pool-wide): the mirror-focused
 exploit checkpoint beats **e3 at 55.7%** on that matchup (201 eps) — e3
 is beatable per-matchup by this architecture; the remaining problem is
 coverage across all 625 pairings, not capability.
+
+## Phase 12 — beating e3 pool-wide (M2), in progress
+
+Multi-deck PFSP from the merged BC start plateaued again at ~40% vs e3
+(33.0 → 40.0 at 180k → 40.0 at 598k → run finished at 800k). Diagnosis
+tooling (`rl/matchup_matrix.py`) revealed the aggregate hides a 10%–60%
+per-deck spread — but the first focused-legs attempt on the lowest
+absolute decks failed (fire: 10% → 9.9% after a 70k leg), which exposed a
+confound: **absolute per-deck win rate mixes deck strength with piloting
+skill.** Measuring e3's own seat-0 baseline per deck (e3-vs-e3, same
+protocol) showed e3 pilots fire/blastoiseex to only 15%/17.5% — those
+decks are simply weak against the field; there was nothing to learn.
+
+The actionable metric is the **skill gap** (our rate − e3's rate with the
+same deck): mean −10.6pp, concentrated in arceusdialga (−30), metal-
+barrier (−28), baby-mega-blaziken (−27), mewtwoex (−22), mega-garde (−21).
+Note also e3's own seat-0 mean is 47.5%, so "beat e3" (>50%) requires
+out-piloting an opponent that sees our hand, not merely matching it —
+which the mirror result (55.7% vs e3) proves is possible per-matchup.
+Focused legs now target the largest gaps.
