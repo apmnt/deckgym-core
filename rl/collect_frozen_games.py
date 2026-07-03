@@ -42,6 +42,12 @@ def main():
     p.add_argument("--num-envs", type=int, default=32)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--sample", action="store_true", help="agents sample instead of argmax")
+    p.add_argument(
+        "--record-seats",
+        choices=["0", "1", "both"],
+        default="both",
+        help="which seat's decisions to record (e.g. only the stronger agent's)",
+    )
     p.add_argument("--out", required=True)
     args = p.parse_args()
     device = torch.device("cpu")
@@ -89,12 +95,13 @@ def main():
             actions = [int(x) for x in actions]
             # Record the *unadapted* observation: the BC consumer is the
             # deck-general architecture.
-            for k, env_id in enumerate(ids):
-                n = int(n_actions[env_id])
-                open_eps[env_id].append(
-                    (seat, obs[env_id].copy(), oracle[env_id].copy(),
-                     feats[env_id, :n].copy(), actions[k])
-                )
+            if args.record_seats in ("both", str(seat)):
+                for k, env_id in enumerate(ids):
+                    n = int(n_actions[env_id])
+                    open_eps[env_id].append(
+                        (seat, obs[env_id].copy(), oracle[env_id].copy(),
+                         feats[env_id, :n].copy(), actions[k])
+                    )
             _, dones, outcomes = env.step_some([int(i) for i in ids], actions)
             for env_id, done, outcome in zip(ids, dones, outcomes):
                 if done:

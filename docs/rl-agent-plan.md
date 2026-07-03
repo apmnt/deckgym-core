@@ -334,3 +334,29 @@ Findings so far:
 - Next attempt: distill-then-exploit — BC-clone the champion's own games
   (rl/collect_frozen_games.py) into the general architecture, then run
   the exploiter from inside the champion's strategy region.
+
+### Phase 11 breakthrough: distill-then-exploit
+
+The fifth attempt worked. Instead of exploiting from the general policy
+(four runs, all parity), we first BC-cloned the champion from 4,000 of
+its own mirror games (`rl/collect_frozen_games.py`, both seats recorded;
+84.9% move agreement, 48.2% head-to-head — a faithful clone), then ran
+the same conservative exploiter (300k steps, champion-only roster) from
+*inside the champion's strategy region*:
+
+**`rl/checkpoints/mirror_champbeater.pt` beats the champion 54.0%
+(866/1604 episodes, 4 seeds x both seatings, Wilson CI [51.5, 56.4],
+every cell >= 50.5%).**
+
+Interpretation: best-response search from a distant policy kept getting
+pulled back to parity (the conservative updates that preserve skills also
+prevent strategy jumps — gen_exploit4 after 950k mirror-only steps still
+scored 99%/77% vs r/e1 on the whole pool, i.e. no forgetting *and* no
+exploit). Starting from the clone converts the problem into finding small
+deviations from the opponent's own play — fictitious-play intuition — and
+those deviations exist and are learnable.
+
+Caveat: the beater is a mirror specialist (69% vs r, 37% vs e1 on the
+pool — it never saw other decks). Ongoing: merge its winning lines into
+the general agent by BC on combined data (multi-deck e3 games + the
+beater's decisions from both seatings), then verify both properties.
