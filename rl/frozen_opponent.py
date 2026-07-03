@@ -20,10 +20,14 @@ from head_to_head import load_agent
 
 
 class FrozenOpponent(nn.Module):
-    def __init__(self, agent: nn.Module, adapter=None):
+    def __init__(self, agent: nn.Module, adapter=None, force_greedy: bool = True):
         super().__init__()
         self.agent = agent
         self.adapter = adapter
+        # Exploit the *deployment* policy: checkpoints are evaluated greedy,
+        # so the roster arm plays greedy regardless of the caller's default
+        # (the self-play env samples frozen nets for diversity).
+        self.force_greedy = force_greedy
         self.config = {"oracle": agent.config.get("oracle", False)}
         self.gru = None  # adapter path supports stateless opponents only
 
@@ -36,7 +40,7 @@ class FrozenOpponent(nn.Module):
             obs = obs[:, self.adapter.obs_idx]
             act_feats = act_feats[:, :, self.adapter.act_idx]
         action, logprob, value, _ = self.agent.act(
-            obs, oracle_obs, act_feats, mask, None, greedy
+            obs, oracle_obs, act_feats, mask, None, greedy or self.force_greedy
         )
         return action, logprob, value, None
 
