@@ -45,6 +45,12 @@ def parse_args():
         help="cache path for the collected games; reused if it exists (for ablations)",
     )
     p.add_argument("--arch", choices=["res", "tx", "mlp", "gen"], default="res")
+    p.add_argument(
+        "--card-text",
+        default="",
+        help="text-feature .npy (rl/build_text_features.py) appended to the "
+        "card attribute table (--arch gen only)",
+    )
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)
@@ -140,6 +146,9 @@ def main():
     if args.oracle and args.aux_belief > 0:
         print("oracle policy sees everything; disabling --aux-belief")
         args.aux_belief = 0.0
+    from agent import fetch_card_table
+
+    card_table = fetch_card_table(args.card_text or None) if args.arch == "gen" else None
     agent = make_agent(
         obs_dim,
         feat_dim,
@@ -150,6 +159,7 @@ def main():
         memory=args.memory,
         belief=args.aux_belief > 0,
         oracle=args.oracle,
+        card_table=card_table,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 

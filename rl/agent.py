@@ -606,14 +606,27 @@ def make_agent(
     return agent
 
 
-def fetch_card_table() -> tuple[torch.Tensor, int]:
+def fetch_card_table(text_features: str | None = None) -> tuple[torch.Tensor, int]:
     """Global card attribute table from the engine: (attr_table, num_cards).
-    The table has num_cards + 1 rows (last = padding id)."""
+    The table has num_cards + 1 rows (last = padding id). With
+    `text_features` (a .npy produced by rl/build_text_features.py), the
+    text-derived vectors are concatenated onto the numeric attributes,
+    giving the CardEncoder wording-level semantics (heal/search/status
+    effects cluster together) on top of stats."""
     import deckgym
 
     flat, attr_dim = deckgym.card_attr_table()
     num_cards = deckgym.num_global_cards()
     table = torch.from_numpy(flat.reshape(num_cards + 1, attr_dim))
+    if text_features:
+        import numpy as np
+
+        text = torch.from_numpy(np.load(text_features).astype("float32"))
+        assert text.shape[0] == num_cards + 1, (
+            f"text feature rows {text.shape[0]} != {num_cards + 1}; "
+            "regenerate with rl/build_text_features.py"
+        )
+        table = torch.cat([table, text], dim=1)
     return table, num_cards
 
 
