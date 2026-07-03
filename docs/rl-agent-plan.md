@@ -301,3 +301,36 @@ Next steps toward >50% vs e3 in the general setting: a larger/wider net
 observations (hand/board as card tokens instead of zone count vectors —
 the tx-arch direction), longer PFSP with league-style exploiters, and BC
 from a stronger demonstrator (e4).
+
+## Phase 11 — trying to beat the mirror champion head-to-head (M1)
+
+Target: >50% pooled greedy head-to-head (both seatings) against
+`bc_pfsp_champion` on venusaur-exeggutor, starting from the deck-general
+agent (39.1% baseline). Method: the frozen champion as a PFSP roster arm
+(`--frozen-opponents`, exploiter pattern).
+
+| Exploit run (sequential, each resumes the last) | Steps | Setup delta | Pooled head-to-head |
+|---|---|---|---|
+| gen_exploit_champ | 400k | champion(sampled)+e2,e3 roster | 49.3% (801) |
+| gen_exploit2 | 250k | champion plays greedy (deployment policy) | 49.2% (801) |
+| gen_exploit3 | 300k | champion-only, ent 0.01→0.002, lr 1.5e-4 | 48.4% (800) |
+| gen_exploit4 | 400k | no target-kl, ent 0.015→0.003 | 49.1% (800) |
+
+Side measurements: the exploiter's *sampling* policy does worse (44.8%);
+temperature 0.25 gives 50.3% ± 5.7 (300 eps, inconclusive); mid-run
+checkpoints sit in the same band.
+
+Findings so far:
+
+- Direct PPO exploitation moved 39% → ~49% quickly, then stayed at parity
+  for 1.35M steps across four hyperparameter regimes. Without target-kl
+  the approx-KL still settles ≈ 0.012 (the clip coefficient binds first),
+  so the "KL guard too tight" hypothesis is dead.
+- Reference: depth-3 expectiminimax *with full hand visibility* achieves
+  only 45.8% against this champion (phase-7 table read in reverse). Our
+  blind general agent at 49% is already the strongest measured opponent
+  of the champion. The champion appears close to unexploitable at this
+  matchup's luck level (opening hands, energy rotation, coin flips).
+- Next attempt: distill-then-exploit — BC-clone the champion's own games
+  (rl/collect_frozen_games.py) into the general architecture, then run
+  the exploiter from inside the champion's strategy region.
