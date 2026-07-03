@@ -360,3 +360,19 @@ Caveat: the beater is a mirror specialist (69% vs r, 37% vs e1 on the
 pool — it never saw other decks). Ongoing: merge its winning lines into
 the general agent by BC on combined data (multi-deck e3 games + the
 beater's decisions from both seatings), then verify both properties.
+
+### Phase 11 completed: the general agent beats the single-deck champion
+
+Merging by distillation worked on the first try. BC on the combined
+dataset — 333k multi-deck e3 decisions + 107k mirror decisions of the
+champion-beater (recorded from its seat only, both seatings) — yields
+**one general model with both properties** (`rl/checkpoints/general_v2.pt`):
+
+- vs mirror champion, head-to-head greedy: **54.2%** [50.8, 57.7] (800 eps)
+- train pool gauntlet: 98.5% r, 77.1% e1, 39.6% e2, 33.0% e3
+- vs e3 *on the mirror*: 50.0%
+
+Bonus finding that shapes M2 (beat e3 pool-wide): the mirror-focused
+exploit checkpoint beats **e3 at 55.7%** on that matchup (201 eps) — e3
+is beatable per-matchup by this architecture; the remaining problem is
+coverage across all 625 pairings, not capability.
