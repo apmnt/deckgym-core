@@ -572,6 +572,13 @@ impl RlEnvCore {
                 return;
             }
             let (actor, actions) = self.state.generate_possible_actions();
+            if actions.is_empty() {
+                // Engine deadlock: a non-terminal state with no legal moves
+                // (rare card-interaction edge). Score it as a tie instead of
+                // leaving the env parked at a zero-action decision point.
+                self.state.winner = Some(GameOutcome::Tie);
+                continue;
+            }
             if actions.len() == 1 {
                 apply_action(&mut self.rng, &mut self.state, &actions[0]);
             } else if actor == OPPONENT && self.opponent.is_some() {
