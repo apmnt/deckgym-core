@@ -84,6 +84,40 @@ uv run python rl/eval.py runs/<run>/latest.pt --deck rl/pools/heldout.pool \
   --opponent e3 --episodes 200 --seeds 999,4242
 ```
 
+## Checkpoints
+
+| File (`rl/checkpoints/`) | What it is |
+|---|---|
+| `general_m2.pt` | **Current best pool-wide general agent** (48.5% e2 / 41.1% e3 on random train-pool matchups) |
+| `general_v2.pt` | General agent merged with the champion-beater lines: beats `bc_pfsp_champion` 54.2% head-to-head, 33% pool e3 |
+| `general_pfsp.pt` | Phase-10 general agent (parent of `general_m2`) |
+| `general_bc.pt` | BC-only warm start (e3 distilled across the pool) |
+| `mirror_champbeater.pt` | Mirror-match specialist that beats `bc_pfsp_champion` 54.0% (distill-then-exploit product; 69% vs r on the pool — *not* a general player) |
+| `bc_pfsp_champion.pt` | Original venusaur-exeggutor mirror specialist (54.2% vs e3 on its matchup; legacy observation layout) |
+| `hidden_info_stage2.pt`, `selfplay_3m.pt`, `oracle_pfsp.pt` | Earlier mirror-match phases (see `docs/rl-agent-plan.md`) |
+
+## Tooling beyond train/eval
+
+- `rl/head_to_head.py` — pit two checkpoints against each other in the
+  same games (both seatings, Wilson CIs); legacy mirror-match checkpoints
+  are auto-detected and fed through a lossless observation adapter.
+- `rl/matchup_matrix.py` — per-deck win rates for a checkpoint (sorted
+  ascending): turns the aggregate pool number into a diagnosis. Compare
+  against e3's own per-deck baseline to get the *skill gap* — absolute
+  per-deck rates mix deck strength with piloting skill.
+- `rl/collect_frozen_games.py` / `rl/collect_vs_bot.py` — record a frozen
+  checkpoint's games (vs itself / vs an engine bot) in the BC dataset
+  format. Specialist gains erode under further RL; distilling their
+  recorded play into one model preserves them (the mechanism behind
+  `general_v2`).
+- `train_selfplay.py --frozen-opponents ckpt.pt,...` — fixed checkpoint
+  roster arms (the AlphaStar exploiter pattern).
+- `rl/build_text_features.py` (TF-IDF+SVD, no extra deps) and
+  `rl/sentence_text_features.py` (MiniLM, needs sentence-transformers) —
+  per-card effect-text features for `--card-text`. Measured **neutral**
+  at BC level in both variants (`docs/rl-agent-plan.md`, phase 12).
+- `rl/run_general.sh`, `rl/run_focus_legs.sh` — pipeline drivers.
+
 ## Setup
 
 ```bash
