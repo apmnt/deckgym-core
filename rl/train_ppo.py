@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from agent import make_agent
+from agent import fetch_card_table, make_agent
 from env_wrapper import VecEnv
 from torch_runtime import (
     agent_from_checkpoint,
@@ -73,6 +73,11 @@ def parse_args():
         choices=["res", "tx", "mlp", "gen"],
         default="res",
         help="network architecture (gen = deck-general card-embedding agent)",
+    )
+    p.add_argument(
+        "--card-text",
+        default=None,
+        help="card text-embedding .npy appended to the gen arch's attribute table",
     )
     p.add_argument("--hidden", type=int, default=None, help="trunk width (default: arch default)")
     p.add_argument(
@@ -148,6 +153,7 @@ def main():
             memory=args.memory,
             belief=args.aux_belief > 0,
             oracle=args.oracle,
+            card_table=fetch_card_table(args.card_text) if args.arch == "gen" else None,
         ).to(device)
     if args.oracle and args.aux_belief > 0:
         print("oracle policy sees everything; disabling --aux-belief")

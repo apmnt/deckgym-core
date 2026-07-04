@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from deckgym import PyRlVecEnv
 
-from agent import make_agent
+from agent import fetch_card_table, make_agent
 from torch_runtime import resolve_device, save_agent_state
 
 
@@ -45,6 +45,12 @@ def parse_args():
         help="cache path for the collected games; reused if it exists (for ablations)",
     )
     p.add_argument("--arch", choices=["res", "tx", "mlp", "gen"], default="res")
+    p.add_argument(
+        "--card-text",
+        default=None,
+        help="card text-embedding .npy (rl/card_text_features.py) appended to "
+        "the gen arch's attribute table",
+    )
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
     p.add_argument("--heads", type=int, default=4)
@@ -140,6 +146,7 @@ def main():
     if args.oracle and args.aux_belief > 0:
         print("oracle policy sees everything; disabling --aux-belief")
         args.aux_belief = 0.0
+    card_table = fetch_card_table(args.card_text) if args.arch == "gen" else None
     agent = make_agent(
         obs_dim,
         feat_dim,
@@ -150,6 +157,7 @@ def main():
         memory=args.memory,
         belief=args.aux_belief > 0,
         oracle=args.oracle,
+        card_table=card_table,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 
