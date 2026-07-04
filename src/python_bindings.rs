@@ -1243,6 +1243,28 @@ impl PyRlVecEnv {
         Ok(out)
     }
 
+    /// Determinized one-ply action values for every env, padded to
+    /// MAX_ACTIONS with zeros (see RlEnvCore::action_values). Test-time
+    /// search over legal information only; raw engine value scale.
+    fn action_values<'py>(
+        &mut self,
+        py: Python<'py>,
+        determinizations: usize,
+        seed: u64,
+    ) -> Bound<'py, PyArray1<f32>> {
+        let n = self.envs.len();
+        let mut out = vec![0.0f32; n * MAX_ACTIONS];
+        self.envs
+            .par_iter_mut()
+            .zip(out.par_chunks_mut(MAX_ACTIONS))
+            .enumerate()
+            .for_each(|(i, (env, chunk))| {
+                let values = env.action_values(determinizations, seed.wrapping_add(i as u64));
+                chunk[..values.len()].copy_from_slice(&values);
+            });
+        out.into_pyarray_bound(py)
+    }
+
     /// Human-readable legal actions of one environment (for debugging).
     fn legal_action_strings(&self, env_idx: usize) -> PyResult<Vec<String>> {
         self.envs

@@ -475,6 +475,49 @@ impl RlEnvCore {
             .collect()
     }
 
+    /// Determinized one-ply action values from the pending actor's
+    /// hidden-information perspective: for each legal action, average the
+    /// engine's baseline value function over `determinizations` samples of
+    /// the hidden information (the opponent's hand/deck split and both deck
+    /// orders are re-dealt uniformly from what the actor could know; chance
+    /// inside the action resolves once per determinization). Raw engine
+    /// value scale (wins ~1e5, points ~1e4) — normalize downstream. This is
+    /// test-time search: it reads only information a real player has.
+    pub fn action_values(&self, determinizations: usize, seed: u64) -> Vec<f32> {
+        use rand::seq::SliceRandom;
+        let actor = self.pending_actor;
+        let opponent = 1 - actor;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut values = vec![0.0f64; self.pending_actions.len()];
+        for _ in 0..determinizations {
+            let mut base = self.state.clone();
+            // The actor knows its own deck's composition but not its order.
+            base.decks[actor].cards.shuffle(&mut rng);
+            // The opponent's hand/deck split is hidden; re-deal it from the
+            // combined unseen pool (composition is public via the decklist).
+            let hand_size = base.hands[opponent].len();
+            let mut pile: Vec<Card> = base.hands[opponent].drain(..).collect();
+            pile.append(&mut base.decks[opponent].cards);
+            pile.shuffle(&mut rng);
+            base.decks[opponent].cards = pile.split_off(hand_size);
+            base.hands[opponent] = pile;
+            for (i, action) in self.pending_actions.iter().enumerate() {
+                let mut next = base.clone();
+                apply_action(&mut rng, &mut next, action);
+                values[i] += match next.winner {
+                    Some(GameOutcome::Win(p)) if p == actor => 200_000.0,
+                    Some(GameOutcome::Win(_)) => -200_000.0,
+                    Some(GameOutcome::Tie) => 0.0,
+                    None => crate::players::baseline_value_function(&next, actor),
+                };
+            }
+        }
+        values
+            .into_iter()
+            .map(|v| (v / determinizations as f64) as f32)
+            .collect()
+    }
+
     pub fn reset(&mut self) {
         self.reset_internal();
     }

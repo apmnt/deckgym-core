@@ -110,6 +110,13 @@ def parse_args():
     p.add_argument("--pool-size", type=int, default=20)
     p.add_argument("--snapshot-every", type=int, default=15, help="updates between pool snapshots")
     p.add_argument(
+        "--snapshot-keep",
+        type=int,
+        default=0,
+        help="save numbered snap_<step>.pt every N updates for post-run "
+        "keep-better selection (0 = off)",
+    )
+    p.add_argument(
         "--bots",
         default="",
         help="comma-separated engine bots mixed into the opponent roster, e.g. e1,e2,e3",
@@ -457,6 +464,12 @@ def main():
         # Throttled: synchronous serialization in the hot loop is wasted I/O.
         if update % 5 == 0:
             save_agent_state(raw_agent, run_dir / "latest.pt")
+        # Keep-better harvesting: long runs are non-monotonic (bursts from
+        # one parent measured 37-41% vs e3), so keep numbered snapshots and
+        # let the caller eval them all and keep the argmax, instead of
+        # betting everything on final.pt.
+        if args.snapshot_keep and update % args.snapshot_keep == 0:
+            save_agent_state(raw_agent, run_dir / f"snap_{global_step:08d}.pt")
 
     save_agent_state(raw_agent, run_dir / "final.pt")
     print(f"done. checkpoints in {run_dir}")
