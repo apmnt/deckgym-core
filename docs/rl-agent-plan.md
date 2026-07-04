@@ -301,3 +301,120 @@ Next steps toward >50% vs e3 in the general setting: a larger/wider net
 observations (hand/board as card tokens instead of zone count vectors —
 the tx-arch direction), longer PFSP with league-style exploiters, and BC
 from a stronger demonstrator (e4).
+
+## Phase 11 — trying to beat the mirror champion head-to-head (M1)
+
+Target: >50% pooled greedy head-to-head (both seatings) against
+`bc_pfsp_champion` on venusaur-exeggutor, starting from the deck-general
+agent (39.1% baseline). Method: the frozen champion as a PFSP roster arm
+(`--frozen-opponents`, exploiter pattern).
+
+| Exploit run (sequential, each resumes the last) | Steps | Setup delta | Pooled head-to-head |
+|---|---|---|---|
+| gen_exploit_champ | 400k | champion(sampled)+e2,e3 roster | 49.3% (801) |
+| gen_exploit2 | 250k | champion plays greedy (deployment policy) | 49.2% (801) |
+| gen_exploit3 | 300k | champion-only, ent 0.01→0.002, lr 1.5e-4 | 48.4% (800) |
+| gen_exploit4 | 400k | no target-kl, ent 0.015→0.003 | 49.1% (800) |
+
+Side measurements: the exploiter's *sampling* policy does worse (44.8%);
+temperature 0.25 gives 50.3% ± 5.7 (300 eps, inconclusive); mid-run
+checkpoints sit in the same band.
+
+Findings so far:
+
+- Direct PPO exploitation moved 39% → ~49% quickly, then stayed at parity
+  for 1.35M steps across four hyperparameter regimes. Without target-kl
+  the approx-KL still settles ≈ 0.012 (the clip coefficient binds first),
+  so the "KL guard too tight" hypothesis is dead.
+- Reference: depth-3 expectiminimax *with full hand visibility* achieves
+  only 45.8% against this champion (phase-7 table read in reverse). Our
+  blind general agent at 49% is already the strongest measured opponent
+  of the champion. The champion appears close to unexploitable at this
+  matchup's luck level (opening hands, energy rotation, coin flips).
+- Next attempt: distill-then-exploit — BC-clone the champion's own games
+  (rl/collect_frozen_games.py) into the general architecture, then run
+  the exploiter from inside the champion's strategy region.
+
+### Phase 11 breakthrough: distill-then-exploit
+
+The fifth attempt worked. Instead of exploiting from the general policy
+(four runs, all parity), we first BC-cloned the champion from 4,000 of
+its own mirror games (`rl/collect_frozen_games.py`, both seats recorded;
+84.9% move agreement, 48.2% head-to-head — a faithful clone), then ran
+the same conservative exploiter (300k steps, champion-only roster) from
+*inside the champion's strategy region*:
+
+**`rl/checkpoints/mirror_champbeater.pt` beats the champion 54.0%
+(866/1604 episodes, 4 seeds x both seatings, Wilson CI [51.5, 56.4],
+every cell >= 50.5%).**
+
+Interpretation: best-response search from a distant policy kept getting
+pulled back to parity (the conservative updates that preserve skills also
+prevent strategy jumps — gen_exploit4 after 950k mirror-only steps still
+scored 99%/77% vs r/e1 on the whole pool, i.e. no forgetting *and* no
+exploit). Starting from the clone converts the problem into finding small
+deviations from the opponent's own play — fictitious-play intuition — and
+those deviations exist and are learnable.
+
+Caveat: the beater is a mirror specialist (69% vs r, 37% vs e1 on the
+pool — it never saw other decks). Ongoing: merge its winning lines into
+the general agent by BC on combined data (multi-deck e3 games + the
+beater's decisions from both seatings), then verify both properties.
+
+### Phase 11 completed: the general agent beats the single-deck champion
+
+Merging by distillation worked on the first try. BC on the combined
+dataset — 333k multi-deck e3 decisions + 107k mirror decisions of the
+champion-beater (recorded from its seat only, both seatings) — yields
+**one general model with both properties** (`rl/checkpoints/general_v2.pt`):
+
+- vs mirror champion, head-to-head greedy: **54.2%** [50.8, 57.7] (800 eps)
+- train pool gauntlet: 98.5% r, 77.1% e1, 39.6% e2, 33.0% e3
+- vs e3 *on the mirror*: 50.0%
+
+Bonus finding that shapes M2 (beat e3 pool-wide): the mirror-focused
+exploit checkpoint beats **e3 at 55.7%** on that matchup (201 eps) — e3
+is beatable per-matchup by this architecture; the remaining problem is
+coverage across all 625 pairings, not capability.
+
+## Phase 12 — beating e3 pool-wide (M2), in progress
+
+Multi-deck PFSP from the merged BC start plateaued again at ~40% vs e3
+(33.0 → 40.0 at 180k → 40.0 at 598k → run finished at 800k). Diagnosis
+tooling (`rl/matchup_matrix.py`) revealed the aggregate hides a 10%–60%
+per-deck spread — but the first focused-legs attempt on the lowest
+absolute decks failed (fire: 10% → 9.9% after a 70k leg), which exposed a
+confound: **absolute per-deck win rate mixes deck strength with piloting
+skill.** Measuring e3's own seat-0 baseline per deck (e3-vs-e3, same
+protocol) showed e3 pilots fire/blastoiseex to only 15%/17.5% — those
+decks are simply weak against the field; there was nothing to learn.
+
+The actionable metric is the **skill gap** (our rate − e3's rate with the
+same deck): mean −10.6pp, concentrated in arceusdialga (−30), metal-
+barrier (−28), baby-mega-blaziken (−27), mewtwoex (−22), mega-garde (−21).
+Note also e3's own seat-0 mean is 47.5%, so "beat e3" (>50%) requires
+out-piloting an opponent that sees our hand, not merely matching it —
+which the mirror result (55.7% vs e3) proves is possible per-matchup.
+Focused legs now target the largest gaps.
+
+### Phase 12 continued: interleaved oversampling works, long runs drift
+
+Sequential focus legs were **zero-sum** (focus decks +1.0pp mean,
+non-focus −2.8pp, aggregate 40% → 35.5%): each leg's lift eroded once its
+deck left the training distribution, only the final legs' lifts survived
+(arceusdialga +12.5pp, baby-mega-blaziken +14.4pp held).
+
+The fix — **interleaved oversampling** (one run, seat-0 spec = all 25
+decks + the 10 skill-gap decks repeated 2 extra times, seat-1 = uniform
+pool) — set a new pool-wide best: **44.0%** [39.2, 48.9] vs e3 at 180k
+steps (from the 40% gen_m2 baseline; milestone metric always measured on
+the *unweighted* pool). But by 500k the same run had drifted back to
+39.3% — the recurring "drift away from the hardest opponent" failure.
+Current recipe therefore: short bursts (~150k) from the best checkpoint
+with full pooled evals between rounds, keeping the better checkpoint each
+time (hill-climbing on the milestone metric directly).
+
+Engine fixes shipped along the way: rare no-legal-move deadlock states
+are now scored as ties (mid-episode and during reset re-deals), which had
+crashed evaluation; and note `uv run` re-syncs a stale cached deckgym
+wheel over a fresh `maturin develop` build — use `uv run --no-sync`.

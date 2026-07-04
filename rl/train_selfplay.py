@@ -115,6 +115,13 @@ def parse_args():
         help="comma-separated engine bots mixed into the opponent roster, e.g. e1,e2,e3",
     )
     p.add_argument(
+        "--frozen-opponents",
+        default="",
+        help="comma-separated checkpoints added to the opponent pool as fixed "
+        "roster arms (legacy mirror-match checkpoints are auto-adapted); the "
+        "exploiter pattern — PFSP focuses on them while they beat the learner",
+    )
+    p.add_argument(
         "--pfsp-power",
         type=float,
         default=2.0,
@@ -192,6 +199,12 @@ def main():
 
     env.set_latest(raw_agent)
     env.add_snapshot(raw_agent, args.pool_size)  # seed the pool with the starting policy
+    for path in [p for p in args.frozen_opponents.split(",") if p]:
+        from frozen_opponent import load_frozen
+
+        env.add_snapshot(load_frozen(path, env.obs_dim, env.act_feat_dim, device),
+                         args.pool_size)
+        print(f"added frozen roster opponent: {path}")
 
     num_steps, num_envs = args.num_steps, args.num_envs
     batch_size = num_steps * num_envs

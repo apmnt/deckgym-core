@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from deckgym import PyRlVecEnv
 
-from agent import fetch_card_table, make_agent
+from agent import make_agent
 from torch_runtime import resolve_device, save_agent_state
 
 
@@ -47,9 +47,15 @@ def parse_args():
     p.add_argument("--arch", choices=["res", "tx", "mlp", "gen"], default="res")
     p.add_argument(
         "--card-text",
-        default=None,
-        help="card text-embedding .npy (rl/card_text_features.py) appended to "
-        "the gen arch's attribute table",
+        default="",
+        help="text-feature .npy (rl/build_text_features.py) appended to the "
+        "card attribute table (--arch gen only)",
+    )
+    p.add_argument(
+        "--fusion",
+        choices=["sum", "mul"],
+        default="sum",
+        help="CardEncoder id/attribute fusion (mul = ygo-agent style gating)",
     )
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--blocks", type=int, default=2)
@@ -146,7 +152,9 @@ def main():
     if args.oracle and args.aux_belief > 0:
         print("oracle policy sees everything; disabling --aux-belief")
         args.aux_belief = 0.0
-    card_table = fetch_card_table(args.card_text) if args.arch == "gen" else None
+    from agent import fetch_card_table
+
+    card_table = fetch_card_table(args.card_text or None) if args.arch == "gen" else None
     agent = make_agent(
         obs_dim,
         feat_dim,
@@ -158,6 +166,7 @@ def main():
         belief=args.aux_belief > 0,
         oracle=args.oracle,
         card_table=card_table,
+        fusion=args.fusion,
     ).to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=args.lr)
 

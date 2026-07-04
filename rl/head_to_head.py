@@ -117,6 +117,8 @@ def run(agent_a, adapter_a, agent_b, adapter_b, args, seed, device):
     obs_dim, feat_dim, max_actions = env.obs_dim(), env.action_feat_dim(), env.max_actions()
     env.reset()
     agents = [(agent_a, adapter_a), (agent_b, adapter_b)]
+    # sample_flags is aligned with *this call's* seating: index = seat.
+    sample_flags = getattr(args, "_seat_sample", (args.sample, args.sample))
     h = [a.initial_state(args.num_envs, device) for a, _ in agents]
     a_wins = b_wins = ties = 0
     while a_wins + b_wins + ties < args.episodes:
@@ -141,7 +143,7 @@ def run(agent_a, adapter_a, agent_b, adapter_b, args, seed, device):
                     torch.as_tensor(av, dtype=torch.float32, device=device),
                     torch.as_tensor(mask[ids], device=device),
                     h_in,
-                    greedy=not args.sample,
+                    greedy=not sample_flags[seat],
                 )
             if h[seat] is not None and h_new is not None:
                 h[seat][ids] = h_new.float()
@@ -171,7 +173,9 @@ def main():
     p.add_argument("--episodes", type=int, default=400, help="episodes per seating")
     p.add_argument("--num-envs", type=int, default=32)
     p.add_argument("--seeds", default="999,4242", help="comma-separated env seeds")
-    p.add_argument("--sample", action="store_true", help="sample instead of argmax")
+    p.add_argument("--sample", action="store_true", help="both agents sample instead of argmax")
+    p.add_argument("--sample-a", action="store_true", help="agent A samples (stochastic policy)")
+    p.add_argument("--sample-b", action="store_true", help="agent B samples (stochastic policy)")
     p.add_argument("--swap", action="store_true", help="B in seat 0 instead")
     p.add_argument("--both", action="store_true", help="run both seatings and pool")
     p.add_argument("--device", default="cpu")
@@ -185,10 +189,13 @@ def main():
         kind = f"legacy (vocab {adapter.vocab})" if adapter else "deck-general"
         print(f"{name}: {kind}")
 
+    sample_a = args.sample or args.sample_a
+    sample_b = args.sample or args.sample_b
     seatings = [False, True] if args.both else [args.swap]
     total_a = total_b = total_t = 0
     for swap in seatings:
         for seed in (int(s) for s in args.seeds.split(",")):
+            args._seat_sample = (sample_b, sample_a) if swap else (sample_a, sample_b)
             if swap:
                 b, a, t = run(agent_b, adapter_b, agent_a, adapter_a, args, seed, device)
             else:

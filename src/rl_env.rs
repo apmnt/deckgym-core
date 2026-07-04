@@ -480,30 +480,37 @@ impl RlEnvCore {
     }
 
     fn reset_internal(&mut self) {
-        if self.deck_pool_a.len() > 1 {
-            let idx = self.rng.gen_range(0..self.deck_pool_a.len());
-            self.deck_a = self.deck_pool_a[idx].clone();
+        // A freshly dealt game can, very rarely, roll into a terminal state
+        // (engine deadlock scored as a tie) before anyone gets a real
+        // decision; re-deal until the episode is live.
+        loop {
+            if self.deck_pool_a.len() > 1 {
+                let idx = self.rng.gen_range(0..self.deck_pool_a.len());
+                self.deck_a = self.deck_pool_a[idx].clone();
+            }
+            if self.deck_pool_b.len() > 1 {
+                let idx = self.rng.gen_range(0..self.deck_pool_b.len());
+                self.deck_b = self.deck_pool_b[idx].clone();
+            }
+            self.vocab = CardVocab::from_decks(&self.deck_a, &self.deck_b);
+            // The bot holds a deck; rebuild it for the sampled matchup.
+            self.opponent = self.opponent_code.clone().map(|code| {
+                create_players(
+                    self.deck_a.clone(),
+                    self.deck_b.clone(),
+                    vec![code.clone(), code],
+                )
+                .into_iter()
+                .nth(1)
+                .unwrap()
+            });
+            self.state = State::initialize(&self.deck_a, &self.deck_b, &mut self.rng);
+            self.prev_potential = 0.0;
+            self.advance_until_agent_decision();
+            if !self.state.is_game_over() && !self.pending_actions.is_empty() {
+                return;
+            }
         }
-        if self.deck_pool_b.len() > 1 {
-            let idx = self.rng.gen_range(0..self.deck_pool_b.len());
-            self.deck_b = self.deck_pool_b[idx].clone();
-        }
-        self.vocab = CardVocab::from_decks(&self.deck_a, &self.deck_b);
-        // The bot holds a deck; rebuild it for the sampled matchup.
-        self.opponent = self.opponent_code.clone().map(|code| {
-            create_players(
-                self.deck_a.clone(),
-                self.deck_b.clone(),
-                vec![code.clone(), code],
-            )
-            .into_iter()
-            .nth(1)
-            .unwrap()
-        });
-        self.state = State::initialize(&self.deck_a, &self.deck_b, &mut self.rng);
-        self.prev_potential = 0.0;
-        self.advance_until_agent_decision();
-        debug_assert!(!self.state.is_game_over());
     }
 
     /// Ask a freshly built engine bot (for the current matchup) to choose
@@ -572,6 +579,13 @@ impl RlEnvCore {
                 return;
             }
             let (actor, actions) = self.state.generate_possible_actions();
+            if actions.is_empty() {
+                // Engine deadlock: a non-terminal state with no legal moves
+                // (rare card-interaction edge). Score it as a tie instead of
+                // leaving the env parked at a zero-action decision point.
+                self.state.winner = Some(GameOutcome::Tie);
+                continue;
+            }
             if actions.len() == 1 {
                 apply_action(&mut self.rng, &mut self.state, &actions[0]);
             } else if actor == OPPONENT && self.opponent.is_some() {
