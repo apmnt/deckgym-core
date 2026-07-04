@@ -502,8 +502,20 @@ impl RlEnvCore {
             base.decks[opponent].cards = pile.split_off(hand_size);
             base.hands[opponent] = pile;
             for (i, action) in self.pending_actions.iter().enumerate() {
+                // Some engine-generated actions reference specific cards in
+                // the opponent's (hidden) hand; after re-dealing, applying
+                // them can panic. Score the unmodified determinization for
+                // those rare actions instead of crashing.
                 let mut next = base.clone();
-                apply_action(&mut rng, &mut next, action);
+                let seed = rng.gen::<u64>();
+                let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut local_rng = StdRng::seed_from_u64(seed);
+                    apply_action(&mut local_rng, &mut next, action);
+                }))
+                .is_ok();
+                if !applied {
+                    next = base.clone();
+                }
                 values[i] += match next.winner {
                     Some(GameOutcome::Win(p)) if p == actor => 200_000.0,
                     Some(GameOutcome::Win(_)) => -200_000.0,
