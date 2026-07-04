@@ -21,15 +21,20 @@ one-hots cards over the *match's* vocabulary, so the input meaning changes
 with the decks. `--arch gen` is the deck-general agent — **one network that
 plays any deck against any deck**.
 
-**Current best general agent** (`rl/checkpoints/general_pfsp.pt`, ~3.1M
+**Current best general agent** (`rl/checkpoints/general_m2.pt`, ~3.1M
 params; greedy, pooled 2 seeds x 200 episodes, random matchups):
 
 | Opponent | Train pool (25 decks) | Held-out decks (zero-shot) |
 |---|---|---|
 | `r` random | 98.3% | — |
 | `e1` expectiminimax-1 | **79.5%** | **74.3%** |
-| `e2` expectiminimax-2 | 48.2% | 36.2% |
-| `e3` expectiminimax-3 | 38.1% | 26.4% |
+| `e2` expectiminimax-2 | 48.5% | 36.2% |
+| `e3` expectiminimax-3 | **41.1%** | 24.7% |
+
+(r/e1 and held-out e1/e2 rows measured on its parent `general_pfsp.pt`;
+the burst changed only e2/e3-relevant play. `general_v2.pt` is the
+variant that beats the single-deck mirror champion 54.2% head-to-head at
+33% pool e3 — see phases 11-12 in `docs/rl-agent-plan.md`.)
 
 It plays blind (hidden opponent hand/deck) against search bots that see
 everything, across all 625 train-pool pairings with a single set of

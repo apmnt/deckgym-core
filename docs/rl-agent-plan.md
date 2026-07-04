@@ -438,3 +438,17 @@ oversampling checkpoint was lost. Two results:
   variant; the 49% was single-seed variance. (Reminder of the phase-7
   rule: never claim a result from one 100-200 episode seed; the same
   checkpoint legitimately ranges ±10pp.)
+
+Hill-climb continuation (this session): burst 2 (150k from burst 1,
+seed 7) regressed to 37.2% [32.7, 42.1] and was rejected; burst 3
+(150k from burst 1, seed 11) read 40.5% [35.8, 45.4] — not better,
+second rejected step, so the climb stops here at **general_m2.pt =
+41.1% vs e3 pool-wide** (from 33.0% at the gen_m2 start and 38.1% for
+general_pfsp). Its full record: 48.5% vs e2 [43.6, 53.4] (e2 strength
+preserved through the bursts), 24.7% vs e3 on held-out decks (the
+oversampling gain is in-pool by construction). The burst variance
+(41.1 / 37.2 / 40.5 from the same parent) says single 150k bursts move
+the metric by only ~±3pp against ±4.5pp CIs — future rounds should
+either lengthen bursts with mid-run keep-better checkpointing or switch
+to the specialist-distillation track (rl/collect_vs_bot.py) where
+per-matchup gains provably persist through BC merging.
