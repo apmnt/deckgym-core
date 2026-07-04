@@ -237,11 +237,14 @@ those decks were simply weak.
 | best per-matchup (mirror exploit ckpt) | — | — | 55.7% | proves e3 is beatable per-matchup |
 | `e3`'s own seat-0 average with pool decks | — | — | 47.5% | "beat e3" = out-pilot an oracle |
 
-Open problems, in order: pool-wide e3 coverage (phase 13, specialist
-distillation), zero-shot transfer depth (richer attributes), harvesting
-burst variance (snapshot keep-better), and test-time search (determinized
-one-ply lookahead over the trained policy — the only untried lever that
-needs no additional training).
+Open problems, updated after the phase-13 campaign: keyword-flag
+attributes were the one lever that moved a number (+5pp at BC level) and
+should ride the next full BC->PFSP line; specialist distillation needs
+specialists with real per-deck deltas (the oversampling burst had already
+absorbed them); determinized one-ply search with the engine's hand-crafted
+value function measured *negative* (e1-grade judgment diluting a stronger
+policy) — honest search needs a learned policy-view value head; snapshot
+keep-better is implemented and awaits a long run.
 
 ## 10. Glossary
 

@@ -452,3 +452,22 @@ the metric by only ~±3pp against ±4.5pp CIs — future rounds should
 either lengthen bursts with mid-run keep-better checkpointing or switch
 to the specialist-distillation track (rl/collect_vs_bot.py) where
 per-matchup gains provably persist through BC merging.
+
+## Phase 13 — four improvement levers, measured
+
+Campaign against the pool-wide e3 milestone from the `general_m2.pt`
+baseline (41.1%). Outcomes:
+
+| Lever | Result | Verdict |
+|---|---|---|
+| Richer attributes (24 keyword+evolution flags, `rl/keyword_features.py`) | merged BC 29.9% -> **35.0%** vs e3 (+5.1pp) | **first positive representation result**; worth carrying into the next full BC->PFSP line |
+| Specialist distillation (5 gap-deck legs -> record -> BC merge) | merged BC 29.9-35.0%, below baseline | neutral *from this start*: the oversampling burst had already absorbed the per-deck gains (arceusdialga specialist 49.0% vs general_m2's own 45.5% on-deck), and a from-scratch BC merge discards RL fine-tuning; the mechanism needs specialists with real deltas |
+| Test-time determinized 1-ply search (`rl/eval_search.py`) | beta=0: 46.4% (seed 999); beta=1/2/4: 39.1/37.3/38.2% | **negative**: the engine's hand-crafted value function is e1-grade judgment, and blending it into a policy that beats e1 79.5% only hurts. Honest test-time search needs a learned policy-view value head (the PTIE critic is oracle-trained and unusable here) |
+| Longer bursts + mid-run keep-better (`--snapshot-keep`) | implemented, not yet exercised in a long run | mechanism ready; motivated by burst variance 37-41% from one parent |
+
+Net: `general_m2.pt` (41.1% [36.4, 46.0]) stands. The evidence now points
+to one primary route: **rerun the full BC -> conservative PFSP line with
+keyword attributes in the card table** (the only lever that moved a
+number this phase), using `--snapshot-keep` on the long run — and revisit
+specialist distillation only from a base whose per-deck gaps are large
+enough to distill (or with much longer specialist legs).
