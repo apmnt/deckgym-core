@@ -418,3 +418,23 @@ Engine fixes shipped along the way: rare no-legal-move deadlock states
 are now scored as ties (mid-episode and during reset re-deals), which had
 crashed evaluation; and note `uv run` re-syncs a stale cached deckgym
 wheel over a fresh `maturin develop` build — use `uv run --no-sync`.
+
+### Phase 12 continued (session resumption): burst hill-climbing + text ablation
+
+Resumed from the committed state after the container holding the 44%
+oversampling checkpoint was lost. Two results:
+
+- **Oversampling burst 1** (150k steps from `general_pfsp.pt` — the best
+  *committed* pool-wide checkpoint at 38.1% — with the five documented
+  skill-gap decks tripled in the seat-0 distribution, conservative PPO):
+  **41.1%** [36.4, 46.0] vs e3 on the unweighted pool (401 eps, 2 seeds).
+  Now committed as `rl/checkpoints/general_m2.pt`; hill-climbing
+  continues in 150k bursts with keep-better evals between rounds.
+- **Text-feature ablation, resolved.** MiniLM sentence embeddings
+  (`rl/sentence_text_features.py`, 384-dim) appended to the card table,
+  identical data/schedule as the no-text BC: first 100-episode seed
+  read **49.0% vs e3** — but 600 verification episodes came back 32.2%,
+  pooling to 34.6% vs the no-text 32.3%. Neutral, like the TF-IDF
+  variant; the 49% was single-seed variance. (Reminder of the phase-7
+  rule: never claim a result from one 100-200 episode seed; the same
+  checkpoint legitimately ranges ±10pp.)
