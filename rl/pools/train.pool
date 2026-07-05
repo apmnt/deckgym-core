@@ -1,0 +1,28 @@
+# Training deck pool for the deck-general agent: every complete deck in
+# example_decks/ except the four held out in heldout.pool (used to measure
+# zero-shot generalization to unseen decks). Paths are relative to this file.
+../../example_decks/altaria.txt
+../../example_decks/arceusdialga.txt
+../../example_decks/baby-mega-blaziken.txt
+../../example_decks/benchmark-electric.txt
+../../example_decks/blastoiseex.txt
+../../example_decks/chande-cofa.txt
+../../example_decks/coinflip_deck.txt
+../../example_decks/fire.txt
+../../example_decks/flareon.txt
+../../example_decks/galarian-obstagoon.txt
+../../example_decks/giratina-darkrai.txt
+../../example_decks/guzzlord.txt
+../../example_decks/hitmonlee.txt
+../../example_decks/igglybuff-mega-gengar.txt
+../../example_decks/mega-absol-hydreigon.txt
+../../example_decks/mega-garde.txt
+../../example_decks/metal-barrier.txt
+../../example_decks/mewtwoex.txt
+../../example_decks/silvally.txt
+../../example_decks/solgaleo_shiinotic.txt
+../../example_decks/swampert-kanga-ninetails.txt
+../../example_decks/venu-leafon.txt
+../../example_decks/venusaur-exeggutor.txt
+../../example_decks/weezing-arbok.txt
+../../example_decks/zerakoko.txt

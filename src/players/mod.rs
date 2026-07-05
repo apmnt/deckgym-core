@@ -24,7 +24,7 @@ use crate::{actions::Action, Deck, State};
 use rand::rngs::StdRng;
 use std::fmt::Debug;
 
-pub trait Player: Debug {
+pub trait Player: Debug + Send {
     fn get_deck(&self) -> Deck;
     fn decision_fn(
         &mut self,

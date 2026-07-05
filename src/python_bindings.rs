@@ -1,15 +1,20 @@
 #![allow(clippy::useless_conversion)]
 
+use numpy::{IntoPyArray, PyArray1};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use pyo3::wrap_pyfunction;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::{
     deck::Deck,
     game::Game,
     models::{Ability, Attack, Card, EnergyType, PlayedCard},
-    players::{create_players, fill_code_array, parse_player_code},
+    players::{create_players, fill_code_array, parse_player_code, PlayerCode},
+    rl_env::{
+        card_attr_table, global_card_ids, num_global_cards, RlEnvCore, CARD_ATTR_DIM, MAX_ACTIONS,
+    },
     state::{GameOutcome, State},
 };
 
@@ -859,6 +864,437 @@ pub fn py_simulate(
     })
 }
 
+/// Vectorized RL environment over `RlEnvCore`.
+///
+/// With a bot opponent code, the agent always sits in seat 0 and the bot plays
+/// seat 1 inside `step`. With `opponent="self"` (self-play mode) the envs
+/// pause at *both* seats' decisions: `seats()` reports who must act per env,
+/// observations are written from the pending actor's perspective, and
+/// `step_some` advances a chosen subset of envs. Rewards/outcomes are always
+/// from seat 0's perspective. Episodes auto-reset, so every returned
+/// observation belongs to a live game at a decision point. Arrays are
+/// returned flat; reshape Python-side to `(num_envs, obs_dim)` and
+/// `(num_envs, max_actions, action_feat_dim)`.
+#[pyclass(unsendable)]
+pub struct PyRlVecEnv {
+    envs: Vec<RlEnvCore>,
+}
+
+/// Parse a deck spec into a pool: a single deck file, a directory (all
+/// `*.txt` decks inside), a `.pool` file (newline-separated deck paths,
+/// `#` comments allowed, relative to the pool file's directory), or a
+/// comma-separated list of any of these.
+fn parse_deck_pool(spec: &str) -> PyResult<Vec<Deck>> {
+    let mut decks = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let path = std::path::Path::new(part);
+        if path.extension().is_some_and(|ext| ext == "pool") {
+            let base = path.parent().unwrap_or(std::path::Path::new("."));
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to read pool file {part}: {e}"
+                ))
+            })?;
+            for line in content.lines() {
+                let line = line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let deck_path = base.join(line);
+                decks.push(Deck::from_file(deck_path.to_str().unwrap()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to load deck {} (from {part}): {e}",
+                        deck_path.display()
+                    ))
+                })?);
+            }
+        } else if path.is_dir() {
+            let mut files: Vec<_> = std::fs::read_dir(path)
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to read deck folder {part}: {e}"
+                    ))
+                })?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|ext| ext == "txt"))
+                .collect();
+            files.sort();
+            for file in files {
+                decks.push(Deck::from_file(file.to_str().unwrap()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                        "Failed to load deck {}: {e}",
+                        file.display()
+                    ))
+                })?);
+            }
+        } else {
+            decks.push(Deck::from_file(part).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                    "Failed to load deck {part}: {e}"
+                ))
+            })?);
+        }
+    }
+    if decks.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "deck spec '{spec}' contains no decks"
+        )));
+    }
+    Ok(decks)
+}
+
+type StepArrays<'py> = (
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<u32>>,
+);
+
+type EnvWriteItem<'a> = (
+    (
+        ((&'a mut RlEnvCore, &'a mut [f32]), &'a mut [f32]),
+        &'a mut [f32],
+    ),
+    &'a mut u32,
+);
+
+impl PyRlVecEnv {
+    fn arrays<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
+        let obs_dim = self.envs[0].obs_dim();
+        let feat_dim = self.envs[0].action_feat_dim();
+        let n = self.envs.len();
+        let mut obs = vec![0.0f32; n * obs_dim];
+        let mut oracle_obs = vec![0.0f32; n * obs_dim];
+        let mut feats = vec![0.0f32; n * MAX_ACTIONS * feat_dim];
+        let mut n_actions = vec![0u32; n];
+        // par_iter_mut: RlEnvCore is Send but not Sync (boxed dyn Player).
+        self.envs
+            .par_iter_mut()
+            .zip(obs.par_chunks_mut(obs_dim))
+            .zip(oracle_obs.par_chunks_mut(obs_dim))
+            .zip(feats.par_chunks_mut(MAX_ACTIONS * feat_dim))
+            .zip(n_actions.par_iter_mut())
+            .for_each(
+                |((((env, obs_chunk), oracle_chunk), feats_chunk), n_act): EnvWriteItem| {
+                    let actor = env.pending_actor();
+                    env.write_observation(obs_chunk, actor, false);
+                    env.write_observation(oracle_chunk, actor, true);
+                    env.write_action_features(feats_chunk);
+                    *n_act = env.num_actions() as u32;
+                },
+            );
+        (
+            obs.into_pyarray_bound(py),
+            oracle_obs.into_pyarray_bound(py),
+            feats.into_pyarray_bound(py),
+            n_actions.into_pyarray_bound(py),
+        )
+    }
+}
+
+#[pymethods]
+impl PyRlVecEnv {
+    #[new]
+    #[pyo3(signature = (deck_a_path, deck_b_path, opponent="r", num_envs=1, seed=0, shaping_coef=0.0))]
+    pub fn new(
+        deck_a_path: &str,
+        deck_b_path: &str,
+        opponent: &str,
+        num_envs: usize,
+        seed: u64,
+        shaping_coef: f32,
+    ) -> PyResult<Self> {
+        if num_envs == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "num_envs must be >= 1",
+            ));
+        }
+        let code = if opponent == "self" {
+            None
+        } else {
+            let code = parse_player_code(opponent)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+            if code == PlayerCode::H {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Human opponent is not supported in the RL environment",
+                ));
+            }
+            Some(code)
+        };
+        let pool_a = parse_deck_pool(deck_a_path)?;
+        let pool_b = parse_deck_pool(deck_b_path)?;
+
+        let envs = (0..num_envs)
+            .map(|i| {
+                RlEnvCore::new_with_pools(
+                    pool_a.clone(),
+                    pool_b.clone(),
+                    code.clone(),
+                    seed.wrapping_add(i as u64),
+                    shaping_coef,
+                )
+            })
+            .collect();
+        Ok(PyRlVecEnv { envs })
+    }
+
+    fn num_envs(&self) -> usize {
+        self.envs.len()
+    }
+
+    fn obs_dim(&self) -> usize {
+        self.envs[0].obs_dim()
+    }
+
+    fn action_feat_dim(&self) -> usize {
+        self.envs[0].action_feat_dim()
+    }
+
+    fn max_actions(&self) -> usize {
+        MAX_ACTIONS
+    }
+
+    /// Reset all environments.
+    /// Returns (obs, oracle_obs, action_feats, n_actions), flat.
+    /// `obs` hides the opponent's hand/deck composition (what a real player
+    /// sees); `oracle_obs` is the full state for a training-time critic.
+    fn reset<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
+        for env in &mut self.envs {
+            env.reset();
+        }
+        self.arrays(py)
+    }
+
+    /// Step every environment with the chosen legal-action indices.
+    ///
+    /// Returns (obs, oracle_obs, action_feats, n_actions, rewards, dones,
+    /// outcomes). `outcomes[i]` is +1/-1/0 from the agent's perspective and
+    /// only meaningful where `dones[i]` is true. Done envs auto-reset; their
+    /// returned observation is the first decision of the next episode.
+    #[allow(clippy::type_complexity)]
+    fn step<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: Vec<usize>,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<u32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<i8>>,
+    )> {
+        if actions.len() != self.envs.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "expected {} actions, got {}",
+                self.envs.len(),
+                actions.len()
+            )));
+        }
+        for (env, &action) in self.envs.iter().zip(actions.iter()) {
+            if action >= env.num_actions() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "action index {} out of range ({} legal actions)",
+                    action,
+                    env.num_actions()
+                )));
+            }
+        }
+        let n = self.envs.len();
+        let mut rewards = vec![0.0f32; n];
+        let mut dones = vec![false; n];
+        let mut outcomes = vec![0i8; n];
+        let results = self
+            .envs
+            .par_iter_mut()
+            .zip(actions)
+            .map(|(env, action)| env.step(action))
+            .collect::<Vec<_>>();
+        for (i, result) in results.into_iter().enumerate() {
+            rewards[i] = result.reward;
+            dones[i] = result.done;
+            outcomes[i] = result.outcome;
+        }
+        let (obs, oracle_obs, feats, n_actions) = self.arrays(py);
+        Ok((
+            obs,
+            oracle_obs,
+            feats,
+            n_actions,
+            rewards.into_pyarray_bound(py),
+            dones.into_pyarray_bound(py),
+            outcomes.into_pyarray_bound(py),
+        ))
+    }
+
+    /// Seat that must act next in each env (always 0 with a bot opponent).
+    fn seats<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
+        self.envs
+            .iter()
+            .map(|env| env.pending_actor() as u32)
+            .collect::<Vec<_>>()
+            .into_pyarray_bound(py)
+    }
+
+    /// Step only the envs in `indices` (self-play mode). Returns
+    /// (rewards, dones, outcomes) aligned with `indices`, seat-0 perspective.
+    /// Call `reset`/`arrays` semantics as usual: fresh observations for all
+    /// envs come from the next `observe` call.
+    #[allow(clippy::type_complexity)]
+    fn step_some<'py>(
+        &mut self,
+        py: Python<'py>,
+        indices: Vec<usize>,
+        actions: Vec<usize>,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<i8>>,
+    )> {
+        if indices.len() != actions.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "indices and actions must have the same length",
+            ));
+        }
+        // Scatter actions into a per-env slot so the disjoint subset can be
+        // stepped in parallel, then gather results back into `indices` order.
+        let mut action_of = vec![usize::MAX; self.envs.len()];
+        let mut slot_of = vec![usize::MAX; self.envs.len()];
+        for (k, (&i, &action)) in indices.iter().zip(actions.iter()).enumerate() {
+            let env = self.envs.get(i).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyIndexError, _>("env index out of range")
+            })?;
+            if action_of[i] != usize::MAX {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "duplicate env index in step_some",
+                ));
+            }
+            if action >= env.num_actions() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "action index {} out of range ({} legal actions)",
+                    action,
+                    env.num_actions()
+                )));
+            }
+            action_of[i] = action;
+            slot_of[i] = k;
+        }
+        let mut rewards = vec![0.0f32; indices.len()];
+        let mut dones = vec![false; indices.len()];
+        let mut outcomes = vec![0i8; indices.len()];
+        let results: Vec<(usize, crate::rl_env::StepResult)> = self
+            .envs
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| action_of[*i] != usize::MAX)
+            .map(|(i, env)| (slot_of[i], env.step(action_of[i])))
+            .collect();
+        for (k, result) in results {
+            rewards[k] = result.reward;
+            dones[k] = result.done;
+            outcomes[k] = result.outcome;
+        }
+        Ok((
+            rewards.into_pyarray_bound(py),
+            dones.into_pyarray_bound(py),
+            outcomes.into_pyarray_bound(py),
+        ))
+    }
+
+    /// Current observations/features without stepping (pending-actor
+    /// perspective). Same tuple as `reset`.
+    fn observe<'py>(&mut self, py: Python<'py>) -> StepArrays<'py> {
+        self.arrays(py)
+    }
+
+    /// Ask an engine bot (player code, e.g. "e2") to choose an action for
+    /// each env in `indices`, returning chosen legal-action indices aligned
+    /// with `indices`. Does not step the envs. Runs bots in parallel — used
+    /// to mix engine bots into the self-play opponent roster.
+    fn bot_decide_many(&mut self, indices: Vec<usize>, code: &str) -> PyResult<Vec<usize>> {
+        let code =
+            parse_player_code(code).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        let mut slot_of = vec![usize::MAX; self.envs.len()];
+        for (k, &i) in indices.iter().enumerate() {
+            if i >= self.envs.len() {
+                return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
+                    "env index out of range",
+                ));
+            }
+            if slot_of[i] != usize::MAX {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "duplicate env index in bot_decide_many",
+                ));
+            }
+            slot_of[i] = k;
+        }
+        let picks: Vec<(usize, usize)> = self
+            .envs
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| slot_of[*i] != usize::MAX)
+            .map(|(i, env)| (slot_of[i], env.decide_with_code(&code)))
+            .collect();
+        let mut out = vec![0usize; indices.len()];
+        for (k, idx) in picks {
+            out[k] = idx;
+        }
+        Ok(out)
+    }
+
+    /// Determinized one-ply action values for every env, padded to
+    /// MAX_ACTIONS with zeros (see RlEnvCore::action_values). Test-time
+    /// search over legal information only; raw engine value scale.
+    fn action_values<'py>(
+        &mut self,
+        py: Python<'py>,
+        determinizations: usize,
+        seed: u64,
+    ) -> Bound<'py, PyArray1<f32>> {
+        let n = self.envs.len();
+        let mut out = vec![0.0f32; n * MAX_ACTIONS];
+        self.envs
+            .par_iter_mut()
+            .zip(out.par_chunks_mut(MAX_ACTIONS))
+            .enumerate()
+            .for_each(|(i, (env, chunk))| {
+                let values = env.action_values(determinizations, seed.wrapping_add(i as u64));
+                chunk[..values.len()].copy_from_slice(&values);
+            });
+        out.into_pyarray_bound(py)
+    }
+
+    /// Human-readable legal actions of one environment (for debugging).
+    fn legal_action_strings(&self, env_idx: usize) -> PyResult<Vec<String>> {
+        self.envs
+            .get(env_idx)
+            .map(|env| env.legal_action_strings())
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIndexError, _>("env_idx out of range"))
+    }
+}
+
+/// Static per-card attribute table for embedding-based networks: a flat
+/// `(num_cards + 1) * attr_dim` f32 array in global card-index order (the
+/// last row is the all-zeros padding id), plus the attr dim. Observations
+/// reference these rows through the vocabulary-id section.
+#[pyfunction]
+pub fn py_card_attr_table(py: Python<'_>) -> (Bound<'_, PyArray1<f32>>, usize) {
+    (card_attr_table().into_pyarray_bound(py), CARD_ATTR_DIM)
+}
+
+/// Number of cards in the global index (the padding id equals this value).
+#[pyfunction]
+pub fn py_num_global_cards() -> usize {
+    num_global_cards()
+}
+
+/// Card id strings in global index order (debugging/tooling).
+#[pyfunction]
+pub fn py_global_card_ids() -> Vec<String> {
+    global_card_ids()
+}
+
 /// Get available player types
 #[pyfunction]
 pub fn get_player_types() -> HashMap<String, String> {
@@ -886,7 +1322,11 @@ pub fn deckgym(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyState>()?;
     m.add_class::<PyGameOutcome>()?;
     m.add_class::<PySimulationResults>()?;
+    m.add_class::<PyRlVecEnv>()?;
     m.add_function(wrap_pyfunction!(py_simulate, m)?)?;
     m.add_function(wrap_pyfunction!(get_player_types, m)?)?;
+    m.add_function(wrap_pyfunction!(py_card_attr_table, m)?)?;
+    m.add_function(wrap_pyfunction!(py_num_global_cards, m)?)?;
+    m.add_function(wrap_pyfunction!(py_global_card_ids, m)?)?;
     Ok(())
 }

@@ -23,6 +23,11 @@ classifiers = [
 ]
 keywords = ["pokemon", "tcg", "card-game", "simulation", "ai"]
 dynamic = ["version"]
+dependencies = [
+    "maturin>=1.13.3",
+    "numpy>=1.24.4",
+    "torch>=2.5.1",
+]
 
 [project.urls]
 Homepage = "https://www.deckgym.com"
